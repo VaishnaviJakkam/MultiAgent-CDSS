@@ -47,10 +47,13 @@ def sort_patient_observations(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("Dataset must contain either 'Hour' or 'ICULOS' for chronological ordering")
 
     out = df.copy()
-    sort_columns = [PATIENT_ID_COLUMN, time_col]
+    # Preserve the original patient order while sorting each patient's rows chronologically.
+    patient_order = pd.Categorical(out[PATIENT_ID_COLUMN], categories=out[PATIENT_ID_COLUMN].drop_duplicates().tolist(), ordered=True)
+    out = out.assign(_patient_order=patient_order)
+    sort_columns = ["_patient_order", time_col]
     if "Unnamed: 0" in out.columns:
         sort_columns.append("Unnamed: 0")
-    return out.sort_values(sort_columns, kind="mergesort").reset_index(drop=True)
+    return out.sort_values(sort_columns, kind="mergesort").drop(columns=["_patient_order"]).reset_index(drop=True)
 
 
 def _safe_pct_change(current: float, previous: float) -> float:
@@ -98,7 +101,8 @@ def add_temporal_features(df: pd.DataFrame, selected_columns: list[str] | None =
         or col.endswith(("_change", "_pct_change", "_rolling_mean_3", "_rolling_std_3"))
     ]
     global TEMPORAL_COLUMNS
-    TEMPORAL_COLUMNS = generated
+    TEMPORAL_COLUMNS.clear()
+    TEMPORAL_COLUMNS.extend(generated)
     return out
 
 
