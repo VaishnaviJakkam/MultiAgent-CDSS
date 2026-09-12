@@ -8,6 +8,8 @@ __pycache__/
 # Environments
 venv/
 .env
+.env.*
+!.env.example
 .venv/
 
 # Project artifacts
