@@ -1,138 +1,385 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
-from dataclasses import asdict, dataclass
 from numbers import Real
 from typing import Any
 
 
-SUPPORTED_DISEASES = frozenset({"Sepsis", "AKI"})
+# Parameters whose increase generally represents deterioration
+INCREASE_WORSE = {
+    "HR",
+    "Resp",
+    "WBC",
+    "Lactate",
+}
+
+# Parameters whose decrease generally represents deterioration
+DECREASE_WORSE = {
+    "O2Sat",
+    "SBP",
+    "MAP",
+}
+
+# Temperature is handled separately because both
+# unusually high and unusually low values can matter.
+SPECIAL_PARAMETERS = {
+    "Temp",
+}
+
+CLINICAL_PARAMETERS = (
+    INCREASE_WORSE
+    | DECREASE_WORSE
+    | SPECIAL_PARAMETERS
+)
+
 PROBABILITY_CHANGE_THRESHOLD = 0.05
-
-
-@dataclass(frozen=True)
-class TrendAnalysisResult:
-    patient_id: str
-    disease: str
-    trend: str
-    first_probability: float | None
-    latest_probability: float | None
-    probability_change: float | None
-    observation_count: int
-    assessment_time_start: Any | None
-    assessment_time_end: Any | None
-    status: str
-    message: str
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+CLINICAL_CHANGE_THRESHOLD = 0.05
 
 
 class TrendAnalysisAgent:
-    """Rule-based trend analysis over repeated model assessment results."""
+    """
+    Deterministic longitudinal trend-analysis tool.
 
-    def __init__(self, change_threshold: float = PROBABILITY_CHANGE_THRESHOLD):
-        if change_threshold <= 0.0:
-            raise ValueError("change_threshold must be positive")
-        self.change_threshold = float(change_threshold)
+    Analyzes:
+    1. Sepsis probability over time
+    2. AKI probability over time
+    3. Available clinical parameters over time
 
-    def _normalize_record(self, record: Any) -> dict[str, Any]:
-        if isinstance(record, TrendAnalysisResult):
-            return record.to_dict()
-        if hasattr(record, "to_dict") and callable(record.to_dict):
-            normalized = record.to_dict()
-        elif isinstance(record, dict):
-            normalized = dict(record)
-        else:
-            raise ValueError("Each assessment must be a PatientAssessmentResult or compatible dictionary")
+    This tool does not use an LLM to calculate trends.
+    """
 
-        if "patient_id" not in normalized and "patient_reference" in normalized:
-            normalized["patient_id"] = normalized["patient_reference"]
-        required = {"patient_id", "disease", "probability"}
-        missing = sorted(required.difference(normalized))
-        if missing:
-            raise ValueError(f"Assessment is missing required fields: {missing}")
-        return normalized
+    def __init__(
+        self,
+        probability_threshold: float = PROBABILITY_CHANGE_THRESHOLD,
+        clinical_threshold: float = CLINICAL_CHANGE_THRESHOLD,
+    ) -> None:
 
-    def _validate_and_order(self, assessments: Iterable[Any]) -> list[dict[str, Any]]:
-        if assessments is None:
-            raise ValueError("assessments cannot be None")
-        records = [self._normalize_record(record) for record in assessments]
-        if not records:
-            raise ValueError("assessments cannot be empty")
+        self.probability_threshold = probability_threshold
+        self.clinical_threshold = clinical_threshold
 
-        patient_ids = {record["patient_id"] for record in records}
-        if len(patient_ids) != 1:
-            raise ValueError("All assessments must belong to the same patient")
-        diseases = {record["disease"] for record in records}
-        if len(diseases) != 1:
-            raise ValueError("All assessments must belong to the same disease")
-        disease = next(iter(diseases))
-        if disease not in SUPPORTED_DISEASES:
-            raise ValueError(f"Unsupported disease: {disease}")
+    # =========================================================
+    # DISEASE PROBABILITY TREND
+    # =========================================================
 
-        for record in records:
-            probability = record["probability"]
-            if isinstance(probability, bool) or not isinstance(probability, Real):
-                raise ValueError("Assessment probability must be numeric")
-            probability = float(probability)
-            if not 0.0 <= probability <= 1.0:
-                raise ValueError("Assessment probability must be between 0 and 1")
-            record["probability"] = probability
+    def _probability_trend(
+        self,
+        values: list[float],
+    ) -> dict[str, Any]:
 
-        times = [record.get("assessment_time") for record in records]
-        if all(time is None for time in times):
-            return records
-        if any(time is None for time in times):
-            raise ValueError("Either all assessment times must be present or all must be absent")
-        try:
-            return sorted(records, key=lambda record: record["assessment_time"])
-        except TypeError as exc:
-            raise ValueError("assessment_time values must be mutually orderable") from exc
+        if len(values) < 2:
+            return {
+                "trend": "INSUFFICIENT_DATA",
+                "first": values[0] if values else None,
+                "latest": values[-1] if values else None,
+                "change": None,
+                "count": len(values),
+            }
 
-    def analyze(self, assessments: Iterable[Any]) -> dict[str, Any]:
-        records = self._validate_and_order(assessments)
-        patient_id = str(records[0]["patient_id"])
-        disease = records[0]["disease"]
-        count = len(records)
-        first_probability = records[0]["probability"]
-        latest_probability = records[-1]["probability"]
-        start_time = records[0].get("assessment_time")
-        end_time = records[-1].get("assessment_time")
+        first = float(values[0])
+        latest = float(values[-1])
 
-        if count < 2:
-            return TrendAnalysisResult(
-                patient_id=patient_id,
-                disease=disease,
-                trend="INSUFFICIENT_DATA",
-                first_probability=first_probability,
-                latest_probability=latest_probability,
-                probability_change=None,
-                observation_count=count,
-                assessment_time_start=start_time,
-                assessment_time_end=end_time,
-                status="INSUFFICIENT_DATA",
-                message="At least two assessments are required to determine a trend.",
-            ).to_dict()
+        change = latest - first
 
-        probability_change = latest_probability - first_probability
-        if probability_change > self.change_threshold:
+        if change > self.probability_threshold:
             trend = "WORSENING"
-        elif probability_change < -self.change_threshold:
+
+        elif change < -self.probability_threshold:
             trend = "IMPROVING"
+
         else:
             trend = "STABLE"
 
-        return TrendAnalysisResult(
-            patient_id=patient_id,
-            disease=disease,
-            trend=trend,
-            first_probability=first_probability,
-            latest_probability=latest_probability,
-            probability_change=probability_change,
-            observation_count=count,
-            assessment_time_start=start_time,
-            assessment_time_end=end_time,
-            status="success",
-            message="Prototype probability trend; not a clinical deterioration rule.",
-        ).to_dict()
+        return {
+            "trend": trend,
+            "first": first,
+            "latest": latest,
+            "change": change,
+            "count": len(values),
+        }
+
+    # =========================================================
+    # CLINICAL PARAMETER TREND
+    # =========================================================
+
+    def _clinical_trend(
+        self,
+        parameter: str,
+        values: list[float],
+    ) -> dict[str, Any]:
+
+        if len(values) < 2:
+            return {
+                "trend": "INSUFFICIENT_DATA",
+                "first": values[0] if values else None,
+                "latest": values[-1] if values else None,
+                "change": None,
+                "count": len(values),
+            }
+
+        first = float(values[0])
+        latest = float(values[-1])
+
+        absolute_change = latest - first
+
+        denominator = max(abs(first), 1e-8)
+
+        relative_change = (
+            absolute_change / denominator
+        )
+
+        if parameter in INCREASE_WORSE:
+
+            if relative_change > self.clinical_threshold:
+                trend = "WORSENING"
+
+            elif relative_change < -self.clinical_threshold:
+                trend = "IMPROVING"
+
+            else:
+                trend = "STABLE"
+
+        elif parameter in DECREASE_WORSE:
+
+            if relative_change < -self.clinical_threshold:
+                trend = "WORSENING"
+
+            elif relative_change > self.clinical_threshold:
+                trend = "IMPROVING"
+
+            else:
+                trend = "STABLE"
+
+        elif parameter == "Temp":
+
+            # For temperature, direction alone is not enough.
+            # We only report whether the value is moving.
+            if abs(relative_change) <= self.clinical_threshold:
+                trend = "STABLE"
+            else:
+                trend = "CHANGING"
+
+        else:
+
+            trend = "UNKNOWN"
+
+        return {
+            "trend": trend,
+            "first": first,
+            "latest": latest,
+            "change": absolute_change,
+            "relative_change": relative_change,
+            "count": len(values),
+        }
+
+    # =========================================================
+    # EXTRACT DISEASE HISTORY
+    # =========================================================
+
+    def _extract_disease_probabilities(
+        self,
+        assessments: list[dict[str, Any]],
+        disease: str,
+    ) -> list[float]:
+
+        values = []
+
+        key = disease.lower()
+
+        for assessment in assessments:
+
+            result = assessment.get(key)
+
+            if not isinstance(result, dict):
+                continue
+
+            if result.get("status") != "success":
+                continue
+
+            probability = result.get("probability")
+
+            if (
+                isinstance(probability, Real)
+                and not isinstance(probability, bool)
+            ):
+                values.append(
+                    float(probability)
+                )
+
+        return values
+
+    # =========================================================
+    # EXTRACT CLINICAL HISTORY
+    # =========================================================
+
+    def _extract_clinical_values(
+        self,
+        observations: list[dict[str, Any]],
+        parameter: str,
+    ) -> list[float]:
+
+        values = []
+
+        for observation in observations:
+
+            clinical = observation.get(
+                "clinical_parameters",
+                {},
+            )
+
+            value = clinical.get(parameter)
+
+            if (
+                isinstance(value, Real)
+                and not isinstance(value, bool)
+            ):
+                values.append(
+                    float(value)
+                )
+
+        return values
+
+    # =========================================================
+    # MAIN ANALYSIS
+    # =========================================================
+
+    def analyze(
+        self,
+        history: dict[str, Any],
+    ) -> dict[str, Any]:
+
+        observations = history.get(
+            "observations",
+            [],
+        )
+
+        assessments = history.get(
+            "assessments",
+            [],
+        )
+
+        patient = history.get(
+            "patient",
+            {},
+        )
+
+        patient_id = patient.get(
+            "patient_id",
+        )
+
+        # -----------------------------------------------------
+        # Disease probability trends
+        # -----------------------------------------------------
+
+        disease_trends = {}
+
+        for disease in (
+            "Sepsis",
+            "AKI",
+        ):
+
+            probabilities = (
+                self._extract_disease_probabilities(
+                    assessments,
+                    disease,
+                )
+            )
+
+            disease_trends[disease] = (
+                self._probability_trend(
+                    probabilities
+                )
+            )
+
+        # -----------------------------------------------------
+        # Clinical parameter trends
+        # -----------------------------------------------------
+
+        clinical_trends = {}
+
+        for parameter in sorted(
+            CLINICAL_PARAMETERS
+        ):
+
+            values = (
+                self._extract_clinical_values(
+                    observations,
+                    parameter,
+                )
+            )
+
+            if values:
+
+                clinical_trends[parameter] = (
+                    self._clinical_trend(
+                        parameter,
+                        values,
+                    )
+                )
+
+        # -----------------------------------------------------
+        # Overall deterioration
+        # -----------------------------------------------------
+
+        worsening_signals = []
+
+        improving_signals = []
+
+        for disease, result in disease_trends.items():
+
+            if result["trend"] == "WORSENING":
+                worsening_signals.append(
+                    f"{disease}_risk"
+                )
+
+            elif result["trend"] == "IMPROVING":
+                improving_signals.append(
+                    f"{disease}_risk"
+                )
+
+        for parameter, result in clinical_trends.items():
+
+            if result["trend"] == "WORSENING":
+                worsening_signals.append(
+                    parameter
+                )
+
+            elif result["trend"] == "IMPROVING":
+                improving_signals.append(
+                    parameter
+                )
+
+        if worsening_signals:
+
+            overall = "WORSENING"
+
+        elif improving_signals:
+
+            overall = "IMPROVING"
+
+        else:
+
+            enough_data = (
+                len(observations) >= 2
+                or len(assessments) >= 2
+            )
+
+            overall = (
+                "STABLE"
+                if enough_data
+                else "INSUFFICIENT_DATA"
+            )
+
+        return {
+            "patient_id": patient_id,
+            "overall_trend": overall,
+            "disease_trends": disease_trends,
+            "clinical_trends": clinical_trends,
+            "worsening_signals": worsening_signals,
+            "improving_signals": improving_signals,
+            "observation_count": len(observations),
+            "assessment_count": len(assessments),
+            "status": (
+                "success"
+                if overall != "INSUFFICIENT_DATA"
+                else "insufficient_data"
+            ),
+        }
