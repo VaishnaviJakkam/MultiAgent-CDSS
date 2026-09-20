@@ -3,7 +3,17 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-COLLECTIONS = ("patients", "admissions", "observations", "assessments", "trends", "prioritizations")
+COLLECTIONS = (
+    "patients",
+    "admissions",
+    "observations",
+    "assessments",
+    "trends",
+    "prioritizations",
+    "workflow_events",
+    "workflow_tasks",
+    "lab_reports",
+)
 
 
 def utc_now() -> datetime:

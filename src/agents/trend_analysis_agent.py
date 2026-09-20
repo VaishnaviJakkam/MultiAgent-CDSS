@@ -246,6 +246,9 @@ class TrendAnalysisAgent:
         history: dict[str, Any],
     ) -> dict[str, Any]:
 
+        if isinstance(history, list):
+            return self._analyze_assessment_list(history)
+
         observations = history.get(
             "observations",
             [],
@@ -383,3 +386,39 @@ class TrendAnalysisAgent:
                 else "insufficient_data"
             ),
         }
+
+    def _analyze_assessment_list(
+        self,
+        assessments: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Preserve the legacy assessment-list contract for existing callers."""
+        if not assessments:
+            raise ValueError("assessment history cannot be empty")
+
+        patient_ids = {assessment.get("patient_id") for assessment in assessments}
+        if len(patient_ids) != 1:
+            raise ValueError("assessments must belong to the same patient")
+        diseases = {assessment.get("disease") for assessment in assessments}
+        if len(diseases) != 1:
+            raise ValueError("assessments must belong to the same disease")
+
+        ordered = list(assessments)
+        if all(assessment.get("assessment_time") is not None for assessment in ordered):
+            ordered.sort(key=lambda assessment: assessment["assessment_time"])
+        probabilities = []
+        for assessment in ordered:
+            probability = assessment.get("probability")
+            if not isinstance(probability, Real) or isinstance(probability, bool) or not 0.0 <= float(probability) <= 1.0:
+                raise ValueError("probability must be between 0 and 1")
+            probabilities.append(float(probability))
+
+        trend = self._probability_trend(probabilities)
+        trend["disease"] = next(iter(diseases))
+        trend["patient_id"] = next(iter(patient_ids))
+        trend["first_probability"] = trend["first"]
+        trend["latest_probability"] = trend["latest"]
+        trend["probability_change"] = trend["change"]
+        trend["assessment_time_start"] = ordered[0].get("assessment_time")
+        trend["assessment_time_end"] = ordered[-1].get("assessment_time")
+        trend["status"] = "success" if trend["trend"] != "INSUFFICIENT_DATA" else "INSUFFICIENT_DATA"
+        return trend

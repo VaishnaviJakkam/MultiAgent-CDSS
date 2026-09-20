@@ -191,6 +191,8 @@ class DiseaseAssessmentAgent:
         self,
         patient_id: str,
         admission_id: str,
+        observation_id: str | None = None,
+        assessment_time: Any | None = None,
     ) -> dict[str, Any]:
         """
         Run the complete Disease Assessment Agent.
@@ -342,7 +344,8 @@ class DiseaseAssessmentAgent:
         # STORE COMBINED ASSESSMENT
         # ---------------------------------------------------------
 
-        assessment_time = datetime.now(timezone.utc)
+        if assessment_time is None:
+            assessment_time = datetime.now(timezone.utc)
 
         stored_assessment = self.repository.add_assessment(
             patient_id=patient_id,
@@ -350,6 +353,7 @@ class DiseaseAssessmentAgent:
             assessment_time=assessment_time,
             sepsis_result=state["sepsis"],
             aki_result=state["aki"],
+            observation_id=observation_id,
         )
 
         # ---------------------------------------------------------
@@ -366,5 +370,10 @@ class DiseaseAssessmentAgent:
             "trace": state["trace"],
             "assessment_id": stored_assessment["assessment_id"],
             "assessment_time": assessment_time,
-            "status": "completed",
+            "status": (
+                "completed"
+                if state["sepsis"].get("status") == "success"
+                and state["aki"].get("status") == "success"
+                else "partial_failure"
+            ),
         }
