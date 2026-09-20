@@ -24,54 +24,14 @@ import {
   useNavigate,
 } from "react-router-dom";
 
-
-const API_BASE =
-  "http://127.0.0.1:8000";
-
-
-type DiseaseSummary = {
-  status?: string;
-  probability?: number | null;
-  risk_level?: string | null;
-  trend?: string | null;
-  first_probability?: number | null;
-  latest_probability?: number | null;
-  probability_change?: number | null;
-};
+import {
+  getDashboardPatients,
+  type DashboardPatient,
+  type DashboardResponse,
+} from "../api/clinicalApi";
 
 
-type PrioritySummary = {
-  level?: string;
-  highest_risk_disease?: string | null;
-  reason?: string | null;
-  worsening_diseases?: string[];
-};
-
-
-type PatientSummary = {
-  patient_id: string;
-  admission_id: string;
-
-  observation_count?: number;
-  assessment_count?: number;
-
-  sepsis?: DiseaseSummary;
-  aki?: DiseaseSummary;
-
-  priority?: PrioritySummary;
-
-  latest_parameters?: Record<
-    string,
-    number | null
-  >;
-};
-
-
-type DashboardResponse = {
-  status: string;
-  patient_count: number;
-  patients: PatientSummary[];
-};
+type PatientSummary = DashboardPatient;
 
 
 // =========================================================
@@ -384,6 +344,11 @@ function PatientCard({
               )}
           </span>
         </div>
+
+        <div className="aegis-risk-meta">
+          <span>AKI risk</span>
+          <span>{formatProbability(patient.aki?.probability)}</span>
+        </div>
       </div>
 
       <div className="aegis-mini-vitals">
@@ -449,6 +414,14 @@ function PatientCard({
           observations
         </span>
 
+        <span>
+          {patient.pending_task_count || 0} pending nurse tasks
+        </span>
+
+        <span>
+          {patient.latest_report ? "Latest report available" : "No report"}
+        </span>
+
         <span className="aegis-view-link">
           View patient
 
@@ -505,22 +478,7 @@ export default function ClinicalDashboard() {
         ""
       );
 
-      const response =
-        await fetch(
-          `${API_BASE}/api/dashboard/patients`
-        );
-
-      if (
-        !response.ok
-      ) {
-        throw new Error(
-          `Dashboard request failed (${response.status})`
-        );
-      }
-
-      const data:
-        DashboardResponse =
-        await response.json();
+      const data: DashboardResponse = await getDashboardPatients();
 
       console.log(
         "Clinical dashboard data:",
@@ -551,7 +509,12 @@ export default function ClinicalDashboard() {
 
   useEffect(
     () => {
-      loadDashboard();
+      const initialLoad = window.setTimeout(() => void loadDashboard(), 0);
+      const interval = window.setInterval(() => void loadDashboard(), 15000);
+      return () => {
+        window.clearTimeout(initialLoad);
+        window.clearInterval(interval);
+      };
     },
     []
   );

@@ -23,8 +23,18 @@ class EventBus:
             self._handlers[event_type].append(handler)
 
     def publish(self, event: WorkflowEvent) -> list[Any]:
-        """Persist before dispatching so transitions remain auditable."""
+        """Persist and advance the event lifecycle around synchronous dispatch."""
         if self.event_repository is not None:
             self.event_repository.append(event.to_dict())
+            self.event_repository.mark_processing(event.event_id)
 
-        return [handler(event) for handler in self._handlers[event.event_type]]
+        try:
+            results = [handler(event) for handler in self._handlers[event.event_type]]
+        except Exception as exc:
+            if self.event_repository is not None:
+                self.event_repository.mark_failed(event.event_id, str(exc))
+            raise
+
+        if self.event_repository is not None:
+            self.event_repository.mark_completed(event.event_id)
+        return results

@@ -63,6 +63,17 @@ class TrendCompletedRiskPrioritizationHandler:
                 admission_id=admission_id,
                 payload={"prioritization_id": persisted["_id"], "source_trend_id": source_trend_id, "priority_level": priority},
             ))
+            self.event_bus.publish(WorkflowEvent(
+                event_type=EventType.WORKFLOW_COMPLETED,
+                patient_id=patient_id,
+                admission_id=admission_id,
+                payload={
+                    "prioritization_id": persisted["_id"],
+                    "source_trend_id": source_trend_id,
+                    "priority_level": priority,
+                    "workflow_status": "COMPLETED",
+                },
+            ))
             return {"status": "success", "prioritization": persisted}
         except Exception as exc:
             return {"status": "error", "message": str(exc)}

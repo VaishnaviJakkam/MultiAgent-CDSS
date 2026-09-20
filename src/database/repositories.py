@@ -81,9 +81,43 @@ class WorkflowEventRepository:
         if existing is not None:
             return existing
 
-        stored = with_created_updated({**deepcopy(event), "_id": event_id, "event_id": event_id})
+        stored = with_created_updated({
+            **deepcopy(event),
+            "_id": event_id,
+            "event_id": event_id,
+            "status": event.get("status", "PENDING"),
+            "processing_at": None,
+            "completed_at": None,
+            "failed_at": None,
+            "error": None,
+        })
         self.events.insert_one(stored)
         return stored
+
+    def update_status(self, event_id: str, status: str, error: str | None = None) -> dict[str, Any]:
+        normalized_event_id = require_identifier(event_id, "event_id")
+        event = self.get(normalized_event_id)
+        if event is None:
+            raise ValueError(f"Event not found: {normalized_event_id}")
+        timestamp = utc_now()
+        changes: dict[str, Any] = {"status": status, "updated_at": timestamp, "error": error}
+        if status == "PROCESSING":
+            changes["processing_at"] = timestamp
+        elif status == "COMPLETED":
+            changes["completed_at"] = timestamp
+        elif status == "FAILED":
+            changes["failed_at"] = timestamp
+        self.events.update_one({"event_id": normalized_event_id}, {"$set": changes})
+        return self.get(normalized_event_id)  # type: ignore[return-value]
+
+    def mark_processing(self, event_id: str) -> dict[str, Any]:
+        return self.update_status(event_id, "PROCESSING")
+
+    def mark_completed(self, event_id: str) -> dict[str, Any]:
+        return self.update_status(event_id, "COMPLETED")
+
+    def mark_failed(self, event_id: str, error: str) -> dict[str, Any]:
+        return self.update_status(event_id, "FAILED", error)
 
     def get(self, event_id: str) -> dict[str, Any] | None:
         return self.events.find_one({"event_id": require_identifier(event_id, "event_id")})
@@ -223,10 +257,80 @@ class WorkflowTaskRepository:
         records = self.tasks.find(scope)
         return sorted(records, key=lambda item: item["created_at"])
 
+    def list_tasks(
+        self,
+        patient_id: str | None = None,
+        admission_id: str | None = None,
+        status: Any | None = None,
+    ) -> list[dict[str, Any]]:
+        from .workflow_tasks import TaskStatus
+
+        if admission_id is not None and patient_id is None:
+            raise ValueError("patient_id is required when admission_id is provided")
+        query: dict[str, str] = {}
+        if patient_id is not None:
+            query["patient_id"] = require_identifier(patient_id, "patient_id")
+        if admission_id is not None:
+            query["admission_id"] = require_identifier(admission_id, "admission_id")
+        if status is not None:
+            query["status"] = self._enum_value(status, TaskStatus, "status")
+        records = self.tasks.find(query)
+        return sorted(records, key=lambda item: item["created_at"])
+
     def complete_task(self, task_id: str) -> dict[str, Any]:
         from .workflow_tasks import TaskStatus
 
         return self.update_task(task_id, status=TaskStatus.COMPLETED)
+
+
+class NotificationRepository:
+    """Persistence operations for role-targeted workflow notifications."""
+
+    def __init__(self, database: Any):
+        self.database = database
+        self.notifications = database["notifications"]
+
+    @staticmethod
+    def _notification_id() -> str:
+        return f"notification_{uuid4().hex}"
+
+    def create_notification(
+        self,
+        role: str,
+        notification_type: str,
+        message: str,
+        patient_id: str | None = None,
+        admission_id: str | None = None,
+        event_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(role, str) or not role.strip():
+            raise ValueError("role cannot be empty")
+        if not isinstance(notification_type, str) or not notification_type.strip():
+            raise ValueError("notification_type cannot be empty")
+        if not isinstance(message, str) or not message.strip():
+            raise ValueError("message cannot be empty")
+        if event_id is not None and self.notifications.find_one({"event_id": event_id}) is not None:
+            return self.notifications.find_one({"event_id": event_id})  # type: ignore[return-value]
+        document = with_created_updated({
+            "_id": self._notification_id(),
+            "notification_id": self._notification_id(),
+            "role": role.strip().upper(),
+            "notification_type": notification_type.strip(),
+            "message": message.strip(),
+            "patient_id": patient_id,
+            "admission_id": admission_id,
+            "event_id": event_id,
+            "payload": deepcopy(payload or {}),
+            "read": False,
+        })
+        self.notifications.insert_one(document)
+        return document
+
+    def list_notifications(self, role: str) -> list[dict[str, Any]]:
+        normalized_role = require_identifier(role, "role").upper()
+        records = self.notifications.find({"role": normalized_role})
+        return sorted(records, key=lambda item: item["created_at"], reverse=True)
 
 
 class LabReportRepository:
@@ -580,6 +684,10 @@ class PatientRepository:
     def get_latest_prioritization(self, patient_id: str, admission_id: str) -> dict[str, Any] | None:
         records = self.prioritizations.find(self._scope(patient_id, admission_id))
         return max(records, key=lambda item: item["assessment_time"], default=None)
+
+    def get_patient_prioritizations(self, patient_id: str, admission_id: str) -> list[dict[str, Any]]:
+        records = self.prioritizations.find(self._scope(patient_id, admission_id))
+        return sorted(records, key=lambda item: item["assessment_time"])
 
     def get_patient_history(self, patient_id: str, admission_id: str) -> dict[str, Any]:
         scope = self._scope(patient_id, admission_id)

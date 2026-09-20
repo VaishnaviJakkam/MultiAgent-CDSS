@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useEffect,
   useMemo,
   useState,
@@ -29,7 +30,8 @@ import {
 } from "react-router-dom";
 
 import {
-  getPatientHistory,
+  getDoctorPatient,
+  type DoctorPatientResponse,
 } from "../api/clinicalApi";
 
 import MetricCard from "../components/MetricCard";
@@ -144,7 +146,7 @@ export default function DoctorDashboard() {
   const [
     history,
     setHistory,
-  ] = useState<any>(
+  ] = useState<DoctorPatientResponse | null>(
     null
   );
 
@@ -156,6 +158,8 @@ export default function DoctorDashboard() {
     false
   );
 
+  const [error, setError] = useState("");
+
 
   const [
     selectedParameter,
@@ -166,10 +170,10 @@ export default function DoctorDashboard() {
     );
 
 
-  async function loadHistory(
+  const loadHistory = useCallback(async (
     patient: string = patientId,
     admission: string = admissionId
-  ) {
+  ) => {
     if (
       !patient.trim() ||
       !admission.trim()
@@ -180,10 +184,11 @@ export default function DoctorDashboard() {
     setLoading(
       true
     );
+    setError("");
 
     try {
       const result =
-        await getPatientHistory(
+        await getDoctorPatient(
           patient,
           admission
         );
@@ -197,6 +202,11 @@ export default function DoctorDashboard() {
         result
       );
     } catch (error) {
+      setError(
+        error instanceof Error
+          ? error.message
+          : "Could not load patient history."
+      );
       console.error(
         "Could not load patient history:",
         error
@@ -206,7 +216,7 @@ export default function DoctorDashboard() {
         false
       );
     }
-  }
+  }, [patientId, admissionId]);
 
 
   /*
@@ -220,25 +230,27 @@ export default function DoctorDashboard() {
         queryPatientId &&
         queryAdmissionId
       ) {
-        setPatientId(
-          queryPatientId
+        const initialLoad = window.setTimeout(
+          () => void loadHistory(queryPatientId, queryAdmissionId),
+          0
         );
-
-        setAdmissionId(
-          queryAdmissionId
-        );
-
-        loadHistory(
-          queryPatientId,
-          queryAdmissionId
-        );
+        return () => window.clearTimeout(initialLoad);
       }
     },
     [
       queryPatientId,
       queryAdmissionId,
+      loadHistory,
     ]
   );
+
+  useEffect(() => {
+    if (!patientId.trim() || !admissionId.trim()) return;
+    const initialLoad = window.setTimeout(() => void loadHistory(), 0);
+    const interval = window.setInterval(() => void loadHistory(), 15000);
+    window.clearTimeout(initialLoad);
+    return () => window.clearInterval(interval);
+  }, [loadHistory, patientId, admissionId]);
 
 
   /*
@@ -247,9 +259,10 @@ export default function DoctorDashboard() {
    * -----------------------------
    */
 
-  const observations =
-    history?.observations ||
-    [];
+  const observations = useMemo(
+    () => history?.observations || [],
+    [history]
+  );
 
 
   const latestObservation =
@@ -378,7 +391,7 @@ export default function DoctorDashboard() {
 
   const sepsisTrends =
     trends.filter(
-      (trend: any) =>
+      (trend) =>
         String(
           trend?.disease ||
           ""
@@ -436,8 +449,11 @@ export default function DoctorDashboard() {
    */
 
   const priority =
-    history
-      ?.latest_prioritization;
+    history?.prioritizations?.length
+      ? history.prioritizations[
+          history.prioritizations.length - 1
+        ]
+      : null;
 
 
   /*
@@ -450,10 +466,7 @@ export default function DoctorDashboard() {
     useMemo(
       () =>
         observations.map(
-          (
-            observation: any,
-            index: number
-          ) => ({
+          (observation, index) => ({
             index:
               index + 1,
 
@@ -521,7 +534,7 @@ export default function DoctorDashboard() {
     useMemo(
       () =>
         chartData.filter(
-          (point: any) =>
+          (point) =>
             point[
               selectedParameter
             ] !== null &&
@@ -722,6 +735,43 @@ export default function DoctorDashboard() {
 
 
       {/* TOP METRICS */}
+
+      {history?.patient && (
+        <div className="patient-strip">
+          <div>
+            <label>Patient</label>
+            <strong>{String(history.patient.patient_id || patientId)}</strong>
+          </div>
+          <div>
+            <label>Demographics</label>
+            <span>
+              {Object.entries(history.patient.demographics || {})
+                .map(([key, value]) => `${key}: ${String(value)}`)
+                .join(" | ") || "No demographics available"}
+            </span>
+          </div>
+          <div>
+            <label>Reports</label>
+            <span>{history.reports.length}</span>
+          </div>
+          <div>
+            <label>Tasks</label>
+            <span>{history.tasks.length}</span>
+          </div>
+        </div>
+      )}
+
+      {error && (
+        <div className="empty-state">
+          {error}
+        </div>
+      )}
+
+      {loading && !history && (
+        <div className="empty-state">
+          Loading...
+        </div>
+      )}
 
       <div className="metrics-grid">
         <MetricCard
@@ -1299,7 +1349,7 @@ export default function DoctorDashboard() {
 
                 <Tooltip
                   formatter={(
-                    value: any
+                    value: unknown
                   ) => [
                     `${Number(
                       value

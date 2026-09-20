@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import shutil
 import tempfile
-import uuid
+import os
 from pathlib import Path
 from typing import Any
 
@@ -10,12 +10,20 @@ from fastapi import FastAPI
 from fastapi import File
 from fastapi import Form
 from fastapi import HTTPException
+from fastapi import Query
 from fastapi import UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-
 from src.database.mongodb import MongoDatabase
-from src.database.repositories import PatientRepository
+from src.database.repositories import (
+    LabReportRepository,
+    NotificationRepository,
+    PatientRepository,
+    WorkflowEventRepository,
+    WorkflowTaskRepository,
+)
+from src.database.workflow_tasks import TaskStatus
+from src.events import EventBus, EventType, WorkflowEvent
+from src.events.notifications import NotificationEventHandler
 
 from src.agents.sepsis_agent import (
     SepsisDetectionAgent,
@@ -25,12 +33,26 @@ from src.agents.aki_agent import (
     AKIDetectionAgent,
 )
 
-from src.agents.gemini_planner import (
-    GeminiPlanner,
+from src.agents.disease_assessment_agent import DiseaseAssessmentAgent
+from src.agents.assessment_event_workflow import ObservationReadyAssessmentHandler
+from src.agents.risk_prioritization_event_workflow import TrendCompletedRiskPrioritizationHandler
+from src.agents.trend_event_workflow import AssessmentCompletedTrendHandler
+from src.input.nurse_input_workflow import NurseInputReceivedEventHandler, NurseInputSubmissionService
+from src.input.report_event_workflow import (
+    GenerateResultRequestService,
+    LabReportSubmissionService,
+    ReportProcessedEventHandler,
+    ReportProcessingEventHandler,
 )
-
-from src.input.input_pipeline import (
-    SepsisWorkflowPipeline,
+from src.api.schemas import (
+    DashboardResponse,
+    DoctorPatientResponse,
+    HealthResponse,
+    LabUploadResponse,
+    NurseAudioResponse,
+    NotificationResponse,
+    PatientHistoryResponse,
+    WorkflowTaskResponse,
 )
 
 
@@ -57,54 +79,92 @@ app.add_middleware(
 
 
 # =========================================================
-# DATABASE + AGENTS
+# DATABASE + EVENT WORKFLOW
 # =========================================================
 
-database = MongoDatabase()
+database: Any = None
+repository: PatientRepository
+event_repository: WorkflowEventRepository
+task_repository: WorkflowTaskRepository
+lab_report_repository: LabReportRepository
+notification_repository: NotificationRepository
+event_bus: EventBus
+report_submission_service: LabReportSubmissionService
+generate_result_service: GenerateResultRequestService
+nurse_submission_service: NurseInputSubmissionService
 
-repository = PatientRepository(
-    database
-)
 
-sepsis_agent = SepsisDetectionAgent(
-    model="advanced"
-)
+def configure_workflow(
+    database_instance: Any,
+    sepsis_agent_instance: Any,
+    aki_agent_instance: Any,
+    report_agent_instance: Any | None = None,
+) -> None:
+    """Configure the in-process workflow and its persistence dependencies."""
+    global database, repository, event_repository, task_repository
+    global lab_report_repository, notification_repository, event_bus, report_submission_service
+    global generate_result_service, nurse_submission_service
 
-aki_agent = AKIDetectionAgent()
+    database = database_instance
+    repository = PatientRepository(database)
+    event_repository = WorkflowEventRepository(database)
+    task_repository = WorkflowTaskRepository(database)
+    lab_report_repository = LabReportRepository(database)
+    notification_repository = NotificationRepository(database)
+    event_bus = EventBus(event_repository)
 
-gemini_planner = GeminiPlanner()
+    assessment_agent = DiseaseAssessmentAgent(
+        repository=repository,
+        sepsis_tool=sepsis_agent_instance,
+        aki_tool=aki_agent_instance,
+    )
+    ReportProcessingEventHandler(
+        lab_report_repository,
+        event_bus,
+        report_agent=report_agent_instance,
+    )
+    ReportProcessedEventHandler(
+        lab_report_repository,
+        task_repository,
+        event_bus,
+    )
+    NurseInputReceivedEventHandler(
+        task_repository,
+        lab_report_repository,
+        repository,
+        event_bus,
+    )
+    ObservationReadyAssessmentHandler(repository, event_bus, assessment_agent)
+    AssessmentCompletedTrendHandler(repository, event_bus)
+    TrendCompletedRiskPrioritizationHandler(repository, event_bus)
+    NotificationEventHandler(notification_repository, event_bus)
 
-pipeline = SepsisWorkflowPipeline(
-    repository=repository,
-    sepsis_agent=sepsis_agent,
-    aki_agent=aki_agent,
-    gemini_planner=gemini_planner,
-)
+    def publish_generate_result_request(event: WorkflowEvent) -> None:
+        event_bus.publish(
+            WorkflowEvent(
+                event_type=EventType.GENERATE_RESULT_REQUESTED,
+                patient_id=event.patient_id,
+                admission_id=event.admission_id,
+                related_report_id=event.related_report_id,
+                payload={"report_id": event.related_report_id},
+            )
+        )
+
+    event_bus.subscribe(EventType.REPORT_PROCESSED, publish_generate_result_request)
+    report_submission_service = LabReportSubmissionService(lab_report_repository, event_bus)
+    generate_result_service = GenerateResultRequestService(lab_report_repository, event_bus)
+    nurse_submission_service = NurseInputSubmissionService(task_repository, lab_report_repository, event_bus)
+
+
+if os.getenv("MONGODB_URI"):
+    configure_workflow(
+        MongoDatabase(),
+        SepsisDetectionAgent(model="advanced"),
+        AKIDetectionAgent(),
+    )
 
 
 # =========================================================
-# PENDING INPUT STORE
-# =========================================================
-
-# Temporary workflow/session store.
-#
-# This is intentionally separate from the clinical
-# agent MongoDB collections.
-#
-# For the academic prototype this is sufficient.
-# Later it could become Redis / another persistent store.
-
-pending_inputs: dict[str, dict[str, Any]] = {}
-
-
-# =========================================================
-# REQUEST MODELS
-# =========================================================
-
-class ConfirmationRequest(BaseModel):
-    confirmed_parameters: dict[str, float]
-
-
 # =========================================================
 # TEMP FILE UTILITY
 # =========================================================
@@ -317,8 +377,13 @@ def priority_rank(
 # HEALTH
 # =========================================================
 
-@app.get("/api/health")
-def health():
+@app.get(
+    "/api/health",
+    response_model=HealthResponse,
+    tags=["Dashboard"],
+    summary="Check API and MongoDB connectivity",
+)
+def health() -> HealthResponse:
 
     try:
         connected = database.ping()
@@ -326,380 +391,207 @@ def health():
     except Exception:
         connected = False
 
-    return {
-        "status": "ok",
-        "mongodb": connected,
-    }
+    return HealthResponse(status="ok", mongodb=connected)
+
+
+@app.get(
+    "/api/notifications/{role}",
+    response_model=list[NotificationResponse],
+    tags=["Dashboard"],
+    summary="List workflow notifications for a role",
+)
+def get_notifications(role: str) -> list[dict[str, Any]]:
+    try:
+        return notification_repository.list_notifications(role)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 # =========================================================
-# REPORT UPLOAD
+# EVENT-DRIVEN LAB UPLOAD
 # =========================================================
 
-@app.post("/api/input/report")
-def upload_report(
+@app.post(
+    "/api/lab/upload-report",
+    response_model=LabUploadResponse,
+    tags=["Lab"],
+    summary="Upload a laboratory report and start the workflow",
+)
+def upload_lab_report(
     patient_id: str = Form(...),
     admission_id: str = Form(...),
-    report: UploadFile = File(...),
-):
+    report_file: UploadFile = File(...),
+) -> LabUploadResponse:
+    patient_id = clean_identifier(patient_id, "patient_id")
+    admission_id = clean_identifier(admission_id, "admission_id")
+    require_existing_admission(patient_id, admission_id)
 
-    temporary_path = None
-
+    temporary_path = save_upload_temporarily(report_file)
     try:
-
-        # -------------------------------------------------
-        # Normalize IDs
-        # -------------------------------------------------
-
-        patient_id = clean_identifier(
-            patient_id,
-            "patient_id",
+        report = report_submission_service.submit_report(
+            patient_id=patient_id,
+            admission_id=admission_id,
+            filename=report_file.filename or "report",
+            content_type=report_file.content_type or "application/octet-stream",
+            storage_reference=temporary_path,
         )
-
-        admission_id = clean_identifier(
-            admission_id,
-            "admission_id",
-        )
-
-        # -------------------------------------------------
-        # IMPORTANT:
-        # Validate patient/admission BEFORE starting
-        # OCR/audio workflow.
-        # -------------------------------------------------
-
-        require_existing_admission(
-            patient_id,
-            admission_id,
-        )
-
-        # -------------------------------------------------
-        # Save report temporarily
-        # -------------------------------------------------
-
-        temporary_path = (
-            save_upload_temporarily(
-                report
-            )
-        )
-
-        # -------------------------------------------------
-        # OCR + report processing
-        # -------------------------------------------------
-
-        result = pipeline.process_report(
-            temporary_path
-        )
-
-        # -------------------------------------------------
-        # Create temporary workflow/session
-        # -------------------------------------------------
-
-        input_id = str(
-            uuid.uuid4()
-        )
-
-        pending_inputs[input_id] = {
-            "patient_id": patient_id,
-            "admission_id": admission_id,
-            "report_result":
-                result["report_result"],
-            "nurse_request":
-                result["nurse_request"],
-        }
-
-        print(
-            "\n"
-            "========================================\n"
-            "NEW INPUT WORKFLOW\n"
-            f"input_id     : {input_id}\n"
-            f"patient_id   : {patient_id!r}\n"
-            f"admission_id : {admission_id!r}\n"
-            "========================================\n"
-        )
-
-        return {
-            "status": result["status"],
-            "input_id": input_id,
-            "patient_id": patient_id,
-            "admission_id": admission_id,
-
-            "lab_results":
-                result[
-                    "report_result"
-                ].get(
-                    "lab_results",
-                    {},
-                ),
-
-            "sepsis_parameters":
-                result[
-                    "report_result"
-                ].get(
-                    "sepsis_parameters",
-                    {},
-                ),
-
-            "nurse_request":
-                result["nurse_request"],
-        }
-
-    except HTTPException:
-        raise
-
-    except Exception as exc:
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(exc),
-        ) from exc
-
-    finally:
-
-        if temporary_path:
-
-            path = Path(
-                temporary_path
-            )
-
-            if path.exists():
-                path.unlink()
-
-
-# =========================================================
-# AUDIO UPLOAD
-# =========================================================
-
-@app.post(
-    "/api/input/{input_id}/audio"
-)
-def upload_nurse_audio(
-    input_id: str,
-    audio: UploadFile = File(...),
-):
-
-    if input_id not in pending_inputs:
-
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                "Input session not found "
-                "or expired."
+        persisted_report = lab_report_repository.get_report(report["report_id"]) or report
+        tasks = task_repository.get_patient_tasks(patient_id, admission_id)
+        task = next(
+            (
+                item for item in reversed(tasks)
+                if item.get("metadata", {}).get("report_id") == report["report_id"]
             ),
-        )
-
-    workflow = pending_inputs[
-        input_id
-    ]
-
-    patient_id = workflow[
-        "patient_id"
-    ]
-
-    admission_id = workflow[
-        "admission_id"
-    ]
-
-    # Re-check admission before processing audio.
-    require_existing_admission(
-        patient_id,
-        admission_id,
-    )
-
-    temporary_path = None
-
-    try:
-
-        temporary_path = (
-            save_upload_temporarily(
-                audio
-            )
-        )
-
-        audio_result = (
-            pipeline.process_nurse_audio(
-                temporary_path
-            )
-        )
-
-        nurse_result = (
-            audio_result["nurse_result"]
-        )
-
-        pending_inputs[
-            input_id
-        ][
-            "audio_result"
-        ] = nurse_result
-
-        print(
-            "\n"
-            "========================================\n"
-            "AUDIO PROCESSED\n"
-            f"input_id     : {input_id}\n"
-            f"patient_id   : {patient_id!r}\n"
-            f"admission_id : {admission_id!r}\n"
-            "========================================\n"
-        )
-
-        return {
-            "status":
-                "awaiting_confirmation",
-
-            "input_id":
-                input_id,
-
-            "patient_id":
-                patient_id,
-
-            "admission_id":
-                admission_id,
-
-            "transcript":
-                nurse_result.get(
-                    "transcript"
-                ),
-
-            "extracted_parameters":
-                nurse_result.get(
-                    "extracted_parameters",
-                    {},
-                ),
-
-            "nurse_request":
-                pending_inputs[
-                    input_id
-                ][
-                    "nurse_request"
-                ],
-        }
-
-    except HTTPException:
-        raise
-
-    except Exception as exc:
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(exc),
-        ) from exc
-
-    finally:
-
-        if temporary_path:
-
-            path = Path(
-                temporary_path
-            )
-
-            if path.exists():
-                path.unlink()
-
-
-# =========================================================
-# CONFIRM NURSE VALUES
-# =========================================================
-
-@app.post(
-    "/api/input/{input_id}/confirm"
-)
-def confirm_nurse_values(
-    input_id: str,
-    request: ConfirmationRequest,
-):
-
-    workflow = pending_inputs.get(
-        input_id
-    )
-
-    if workflow is None:
-
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                "Input session not found "
-                "or expired."
-            ),
-        )
-
-    patient_id = clean_identifier(
-        workflow["patient_id"],
-        "patient_id",
-    )
-
-    admission_id = clean_identifier(
-        workflow["admission_id"],
-        "admission_id",
-    )
-
-    # -----------------------------------------------------
-    # Confirm admission still exists before storing
-    # observation.
-    # -----------------------------------------------------
-
-    require_existing_admission(
-        patient_id,
-        admission_id,
-    )
-
-    print(
-        "\n"
-        "========================================\n"
-        "CONFIRMING OBSERVATION\n"
-        f"input_id     : {input_id}\n"
-        f"patient_id   : {patient_id!r}\n"
-        f"admission_id : {admission_id!r}\n"
-        f"parameters   : "
-        f"{request.confirmed_parameters}\n"
-        "========================================\n"
-    )
-
-    try:
-
-        result = (
-            pipeline.complete_observation(
-                patient_id=patient_id,
-                admission_id=admission_id,
-                report_result=workflow[
-                    "report_result"
-                ],
-                confirmed_parameters=(
-                    request.confirmed_parameters
-                ),
-            )
-        )
-
-    except ValueError as exc:
-
-        raise HTTPException(
-            status_code=400,
-            detail=str(exc),
-        ) from exc
-
-    except HTTPException:
-        raise
-
-    except Exception as exc:
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(exc),
-        ) from exc
-
-    if result["status"] == "completed":
-
-        pending_inputs.pop(
-            input_id,
             None,
         )
+        return LabUploadResponse(
+            report_id=report["report_id"],
+            status=persisted_report["processing_status"],
+            workflow_started=True,
+            task_id=task["task_id"] if task else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        path = Path(temporary_path)
+        if path.exists():
+            path.unlink()
 
-    # Preserve your pipeline result while also making
-    # the workflow identity explicit in the response.
 
-    return {
-        **result,
-        "patient_id": patient_id,
-        "admission_id": admission_id,
+# =========================================================
+# NURSE TASKS
+# =========================================================
+
+@app.get(
+    "/api/nurse/tasks",
+    response_model=list[WorkflowTaskResponse],
+    tags=["Nurse"],
+    summary="List nurse workflow tasks",
+)
+def get_nurse_tasks(
+    patient_id: str | None = Query(default=None),
+    admission_id: str | None = Query(default=None),
+    status: TaskStatus | None = Query(default=None),
+) -> list[dict[str, Any]]:
+    try:
+        return task_repository.list_tasks(patient_id, admission_id, status)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get(
+    "/api/nurse/tasks/{task_id}",
+    response_model=WorkflowTaskResponse,
+    tags=["Nurse"],
+    summary="Get a nurse task and its current question",
+)
+def get_nurse_task(task_id: str) -> dict[str, Any]:
+    task = task_repository.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    metadata = task.get("metadata", {})
+    fields = metadata.get("question_fields", task.get("required_fields", []))
+    index = int(metadata.get("question_index", 0))
+    task["metadata"] = {
+        **metadata,
+        "missing_fields": list(fields[index:]),
+        "current_question": (
+            f"Please provide {fields[index]}." if index < len(fields) else None
+        ),
+        "question_index": index,
+        "report_id": metadata.get("report_id"),
     }
+    return task
+
+
+@app.post(
+    "/api/nurse/tasks/{task_id}/audio",
+    response_model=NurseAudioResponse,
+    tags=["Nurse"],
+    summary="Submit the next nurse questionnaire answer by audio",
+)
+def submit_nurse_audio(
+    task_id: str,
+    audio_file: UploadFile = File(...),
+) -> NurseAudioResponse:
+    task = task_repository.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    temporary_path = save_upload_temporarily(audio_file)
+    try:
+        updated_task = nurse_submission_service.submit_nurse_audio(
+            task_id=task_id,
+            patient_id=task["patient_id"],
+            admission_id=task["admission_id"],
+            audio_path=temporary_path,
+        )
+        current = task_repository.get_task(task_id) or updated_task
+        metadata = current.get("metadata", {})
+        fields = metadata.get("question_fields", current.get("required_fields", []))
+        index = int(metadata.get("question_index", 0))
+        observation = repository.get_observation_by_task(
+            current["patient_id"], current["admission_id"], task_id
+        )
+        completed = current["status"] == TaskStatus.COMPLETED.value
+        return NurseAudioResponse(
+            completed=completed,
+            next_question=(f"Please provide {fields[index]}." if index < len(fields) else None),
+            question_index=index,
+            total_questions=len(fields),
+            observation_id=observation.get("observation_id") if observation else None,
+            assessment_started=observation is not None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        path = Path(temporary_path)
+        if path.exists():
+            path.unlink()
+
+
+# =========================================================
+# DOCTOR PATIENT HISTORY
+# =========================================================
+
+@app.get(
+    "/api/doctor/patient/{patient_id}",
+    response_model=DoctorPatientResponse,
+    tags=["Doctor"],
+    summary="Get the complete patient and admission workflow history",
+)
+def get_doctor_patient(
+    patient_id: str,
+    admission_id: str | None = Query(default=None),
+) -> dict[str, Any]:
+    patient_id = clean_identifier(patient_id, "patient_id")
+    if admission_id is None:
+        admissions = list(database["admissions"].find({"patient_id": patient_id}))
+        if not admissions:
+            raise HTTPException(status_code=404, detail="Patient has no admissions")
+        if len(admissions) > 1:
+            raise HTTPException(status_code=400, detail="admission_id is required for patients with multiple admissions")
+        admission_id = admissions[0]["admission_id"]
+    admission_id = clean_identifier(admission_id, "admission_id")
+    try:
+        history = repository.get_patient_history(patient_id, admission_id)
+        reports = lab_report_repository.get_patient_reports(patient_id, admission_id)
+        tasks = task_repository.get_patient_tasks(patient_id, admission_id)
+        return {
+            "patient": history["patient"],
+            "admission": history["admission"],
+            "observations": history["observations"],
+            "assessments": history["assessments"],
+            "trends": history["trends"],
+            "prioritizations": repository.get_patient_prioritizations(patient_id, admission_id),
+            "reports": reports,
+            "tasks": tasks,
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 # =========================================================
@@ -709,12 +601,15 @@ def confirm_nurse_values(
 @app.get(
     "/api/patients/"
     "{patient_id}/admissions/"
-    "{admission_id}/history"
+    "{admission_id}/history",
+    response_model=PatientHistoryResponse,
+    tags=["Doctor"],
+    summary="Get patient admission history",
 )
 def get_patient_history(
     patient_id: str,
     admission_id: str,
-):
+) -> dict[str, Any]:
 
     patient_id = clean_identifier(
         patient_id,
@@ -746,7 +641,10 @@ def get_patient_history(
 # =========================================================
 
 @app.get(
-    "/api/dashboard/patients"
+    "/api/dashboard/patients",
+    response_model=DashboardResponse,
+    tags=["Dashboard"],
+    summary="Summarize active admissions for clinical monitoring",
 )
 def get_dashboard_patients():
 
@@ -824,6 +722,15 @@ def get_dashboard_patients():
                 or []
             )
 
+            reports = lab_report_repository.get_patient_reports(
+                patient_id,
+                admission_id,
+            )
+            tasks = task_repository.get_patient_tasks(
+                patient_id,
+                admission_id,
+            )
+
             latest_priority = (
                 history.get(
                     "latest_prioritization"
@@ -841,6 +748,9 @@ def get_dashboard_patients():
                     assessments
                 )
             )
+
+            latest_report = get_latest_item(reports)
+            latest_trend = get_latest_item(trends)
 
             latest_sepsis_trend = (
                 get_latest_disease_trend(
@@ -1020,6 +930,24 @@ def get_dashboard_patients():
 
                     "latest_parameters":
                         latest_parameters,
+
+                    "latest_report":
+                        latest_report,
+
+                    "pending_task_count":
+                        sum(
+                            task.get("status") == TaskStatus.PENDING.value
+                            for task in tasks
+                        ),
+
+                    "latest_assessment":
+                        latest_assessment,
+
+                    "latest_trend":
+                        latest_trend,
+
+                    "latest_prioritization":
+                        latest_priority,
                 }
             )
 
@@ -1070,5 +998,5 @@ def get_dashboard_patients():
 
 @app.on_event("shutdown")
 def shutdown_event():
-
-    database.close()
+    if database is not None:
+        database.close()

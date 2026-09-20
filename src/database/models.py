@@ -13,6 +13,7 @@ COLLECTIONS = (
     "workflow_events",
     "workflow_tasks",
     "lab_reports",
+    "notifications",
 )
 
 

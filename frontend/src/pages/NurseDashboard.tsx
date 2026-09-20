@@ -1,430 +1,162 @@
-import { useState } from "react";
-import {
-  CheckCircle2,
-  FileText,
-  Mic,
-  Upload,
-} from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
+import { CheckCircle2, FileText, Mic, RefreshCw, Upload } from "lucide-react";
 
 import {
-  confirmObservation,
-  uploadNurseAudio,
-  uploadReport,
+  getNurseTask,
+  getNurseTasks,
+  submitNurseAudio,
+  uploadLabReport,
+  type LabUploadResponse,
+  type WorkflowTask,
 } from "../api/clinicalApi";
 
-import ParameterCard from "../components/ParameterCard";
+function getQuestion(task: WorkflowTask): string | null {
+  if (task.metadata.current_question) return task.metadata.current_question;
+  const fields = task.metadata.question_fields || task.required_fields;
+  const index = task.metadata.question_index || 0;
+  return index < fields.length ? `Please provide ${fields[index]}.` : null;
+}
 
 export default function NurseDashboard() {
-  const [patientId, setPatientId] = useState(
-  "P1446"
-);
+  const [patientId, setPatientId] = useState("P1446");
+  const [admissionId, setAdmissionId] = useState("ADM-1446");
+  const [reportFile, setReportFile] = useState<File | null>(null);
+  const [audioFile, setAudioFile] = useState<File | null>(null);
+  const [tasks, setTasks] = useState<WorkflowTask[]>([]);
+  const [selectedTask, setSelectedTask] = useState<WorkflowTask | null>(null);
+  const [uploadResult, setUploadResult] = useState<LabUploadResponse | null>(null);
+  const [status, setStatus] = useState("idle");
+  const [loadingTasks, setLoadingTasks] = useState(true);
+  const [error, setError] = useState("");
 
-const [admissionId, setAdmissionId] = useState(
-  "ADM-1446"
-);
+  const refreshTasks = useCallback(async () => {
+    try {
+      setLoadingTasks(true);
+      const result = await getNurseTasks({ patientId, admissionId });
+      setTasks(result);
+      if (selectedTask) setSelectedTask(await getNurseTask(selectedTask.task_id));
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Could not load tasks.");
+    } finally {
+      setLoadingTasks(false);
+    }
+  }, [patientId, admissionId, selectedTask]);
 
-  const [reportFile, setReportFile] =
-    useState<File | null>(null);
+  async function selectTask(taskId: string) {
+    try {
+      setError("");
+      setSelectedTask(await getNurseTask(taskId));
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Could not load task.");
+    }
+  }
 
-  const [audioFile, setAudioFile] =
-    useState<File | null>(null);
-
-  const [inputId, setInputId] =
-    useState("");
-
-  const [nurseRequest, setNurseRequest] =
-    useState<string[]>([]);
-
-  const [extracted, setExtracted] =
-    useState<Record<string, number>>({});
-
-  const [transcript, setTranscript] =
-    useState("");
-
-  const [status, setStatus] =
-    useState("idle");
-
-  const [finalResult, setFinalResult] =
-    useState<any>(null);
+  useEffect(() => {
+    const initialLoad = window.setTimeout(() => void refreshTasks(), 0);
+    const interval = window.setInterval(() => void refreshTasks(), 15000);
+    return () => {
+      window.clearTimeout(initialLoad);
+      window.clearInterval(interval);
+    };
+  }, [refreshTasks]);
 
   async function handleReportUpload() {
     if (!reportFile) return;
-
-    setStatus("processing-report");
-
     try {
-      const result = await uploadReport(
-        patientId,
-        admissionId,
-        reportFile
-      );
-
-      setInputId(result.input_id);
-
-      setNurseRequest(
-        result.nurse_request
-          ?.requested_nurse_fields || []
-      );
-
-      setStatus("report-complete");
-    } catch {
+      setError("");
+      setStatus("processing-report");
+      const result = await uploadLabReport(patientId, admissionId, reportFile);
+      setUploadResult(result);
+      setStatus("workflow-started");
+      await refreshTasks();
+      if (result.task_id) await selectTask(result.task_id);
+    } catch (requestError) {
       setStatus("error");
+      setError(requestError instanceof Error ? requestError.message : "Upload failed.");
     }
   }
 
   async function handleAudioUpload() {
-    if (!audioFile || !inputId) return;
-
-    setStatus("processing-audio");
-
+    if (!audioFile || !selectedTask) return;
     try {
-      const result = await uploadNurseAudio(
-        inputId,
-        audioFile
-      );
-
-      setExtracted(
-        result.extracted_parameters || {}
-      );
-
-      setTranscript(
-        result.transcript || ""
-      );
-
-      setStatus("awaiting-confirmation");
-    } catch {
+      setError("");
+      setStatus("processing-audio");
+      const result = await submitNurseAudio(selectedTask.task_id, audioFile);
+      setSelectedTask(await getNurseTask(selectedTask.task_id));
+      await refreshTasks();
+      setAudioFile(null);
+      setStatus(result.completed ? "completed" : "question-ready");
+    } catch (requestError) {
       setStatus("error");
+      setError(requestError instanceof Error ? requestError.message : "Audio processing failed.");
     }
   }
 
-  function updateParameter(
-    key: string,
-    value: string
-  ) {
-    setExtracted((current) => ({
-      ...current,
-      [key]: Number(value),
-    }));
-  }
-
-  async function handleConfirm() {
-    if (!inputId) return;
-
-    setStatus("saving");
-
-    try {
-      const result =
-        await confirmObservation(
-          inputId,
-          extracted
-        );
-
-      setFinalResult(result);
-      setStatus("completed");
-    } catch {
-      setStatus("error");
-    }
-  }
+  const selectedFields = selectedTask?.metadata.question_fields || selectedTask?.required_fields || [];
+  const selectedIndex = selectedTask?.metadata.question_index || 0;
 
   return (
     <div className="page">
       <div className="page-header">
         <div>
-          <span className="eyebrow">
-            Nurse Workspace
-          </span>
-
-          <h1>New Clinical Observation</h1>
-
-          <p>
-            Upload a report, provide missing
-            bedside parameters and confirm the
-            observation before assessment.
-          </p>
+          <span className="eyebrow">Nurse Workspace</span>
+          <h1>Event-Driven Clinical Tasks</h1>
+          <p>Upload laboratory reports and complete assigned bedside questionnaires.</p>
         </div>
-
-        <div className="live-chip">
-          <span />
-          Live Monitoring
-        </div>
+        <div className="live-chip"><span /> Live Monitoring</div>
       </div>
 
       <div className="patient-strip">
-        <div>
-          <label>Patient ID</label>
-          <input
-            value={patientId}
-            onChange={(e) =>
-              setPatientId(e.target.value)
-            }
-          />
-        </div>
-
-        <div>
-          <label>Admission ID</label>
-          <input
-            value={admissionId}
-            onChange={(e) =>
-              setAdmissionId(e.target.value)
-            }
-          />
-        </div>
-
-        <div className="patient-status">
-          <span className="status-dot" />
-          Active Admission
-        </div>
+        <div><label>Patient ID</label><input value={patientId} onChange={(event) => setPatientId(event.target.value)} /></div>
+        <div><label>Admission ID</label><input value={admissionId} onChange={(event) => setAdmissionId(event.target.value)} /></div>
+        <button className="primary-button" onClick={() => void refreshTasks()} title="Refresh tasks"><RefreshCw size={17} /> Refresh</button>
       </div>
+
+      {error && <div className="empty-state">{error}</div>}
 
       <div className="workflow-grid">
         <section className="workflow-card">
-          <div className="step-header">
-            <div className="step-number">
-              1
-            </div>
-
-            <div>
-              <h2>Upload laboratory report</h2>
-              <p>
-                OCR extracts available lab values.
-              </p>
-            </div>
-          </div>
-
+          <div className="step-header"><div className="step-number">1</div><div><h2>Upload laboratory report</h2><p>Start a durable event-driven workflow.</p></div></div>
           <label className="upload-zone">
             <FileText size={34} />
-
-            <strong>
-              {reportFile
-                ? reportFile.name
-                : "Choose laboratory report"}
-            </strong>
-
-            <span>
-              PNG, JPG or other supported image
-            </span>
-
-            <input
-              type="file"
-              accept="image/*"
-              hidden
-              onChange={(e) =>
-                setReportFile(
-                  e.target.files?.[0] || null
-                )
-              }
-            />
+            <strong>{reportFile ? reportFile.name : "Choose laboratory report"}</strong>
+            <span>PDF, DOCX, PNG or JPG</span>
+            <input type="file" accept=".pdf,.docx,image/*" hidden onChange={(event) => setReportFile(event.target.files?.[0] || null)} />
           </label>
-
-          <button
-            className="primary-button"
-            onClick={handleReportUpload}
-            disabled={!reportFile}
-          >
-            <Upload size={18} />
-            Analyze Report
+          <button className="primary-button" onClick={() => void handleReportUpload()} disabled={!reportFile || status === "processing-report"}>
+            <Upload size={18} /> {status === "processing-report" ? "Uploading..." : "Upload Report"}
           </button>
+          {uploadResult && <div className="result-panel"><strong>Report uploaded</strong><span>Workflow started</span><small>Report ID: {uploadResult.report_id}</small></div>}
         </section>
 
         <section className="workflow-card">
-          <div className="step-header">
-            <div className="step-number">
-              2
-            </div>
-
-            <div>
-              <h2>Required bedside data</h2>
-              <p>
-                Requested based on missing model
-                inputs.
-              </p>
-            </div>
-          </div>
-
-          {nurseRequest.length === 0 ? (
-            <div className="empty-state">
-              Upload a report to determine
-              additional parameters.
-            </div>
-          ) : (
+          <div className="step-header"><div className="step-number">2</div><div><h2>Nurse task queue</h2><p>Tasks refresh every 15 seconds.</p></div></div>
+          {loadingTasks ? <div className="empty-state">Loading...</div> : tasks.length === 0 ? <div className="empty-state">No tasks</div> : (
             <div className="request-grid">
-              {nurseRequest.map((item) => (
-                <div
-                  className="request-chip"
-                  key={item}
-                >
-                  <CheckCircle2 size={16} />
-                  {item}
-                </div>
-              ))}
+              {tasks.map((task) => <button className="request-chip" key={task.task_id} onClick={() => void selectTask(task.task_id)}><CheckCircle2 size={16} /><span>{task.task_id}<br />{task.patient_id} / {task.admission_id}<br />{task.status} - {getQuestion(task) || "Complete"}</span></button>)}
             </div>
           )}
         </section>
 
         <section className="workflow-card">
-          <div className="step-header">
-            <div className="step-number">
-              3
-            </div>
-
-            <div>
-              <h2>Nurse audio input</h2>
-              <p>
-                Speak or upload a recorded bedside
-                observation.
-              </p>
-            </div>
-          </div>
-
-          <label className="audio-zone">
-            <div className="mic-circle">
-              <Mic size={28} />
-            </div>
-
-            <strong>
-              {audioFile
-                ? audioFile.name
-                : "Upload nurse recording"}
-            </strong>
-
-            <span>
-              Speech is converted into structured
-              parameters.
-            </span>
-
-            <input
-              type="file"
-              accept="audio/*"
-              hidden
-              onChange={(e) =>
-                setAudioFile(
-                  e.target.files?.[0] || null
-                )
-              }
-            />
-          </label>
-
-          <button
-            className="primary-button"
-            onClick={handleAudioUpload}
-            disabled={!audioFile || !inputId}
-          >
-            <Mic size={18} />
-            Extract Parameters
-          </button>
-        </section>
-
-        <section className="workflow-card">
-          <div className="step-header">
-            <div className="step-number">
-              4
-            </div>
-
-            <div>
-              <h2>Review extracted values</h2>
-              <p>
-                Confirm or edit before storing.
-              </p>
-            </div>
-          </div>
-
-          {Object.keys(extracted).length === 0 ? (
-            <div className="empty-state">
-              Audio-extracted values will appear
-              here.
-            </div>
-          ) : (
+          <div className="step-header"><div className="step-number">3</div><div><h2>Voice questionnaire</h2><p>Answer the current question to advance the task.</p></div></div>
+          {!selectedTask ? <div className="empty-state">Select a task to begin.</div> : (
             <>
-              <div className="editable-grid">
-                {Object.entries(extracted).map(
-                  ([key, value]) => (
-                    <div
-                      className="editable-field"
-                      key={key}
-                    >
-                      <label>{key}</label>
-
-                      <input
-                        type="number"
-                        step="any"
-                        value={value}
-                        onChange={(e) =>
-                          updateParameter(
-                            key,
-                            e.target.value
-                          )
-                        }
-                      />
-                    </div>
-                  )
-                )}
-              </div>
-
-              {transcript && (
-                <div className="transcript-box">
-                  <span>AI transcript</span>
-                  <p>{transcript}</p>
-                </div>
-              )}
-
-              <div className="confirmation-note">
-                Review all values before confirming
-                the observation.
-              </div>
-
-              <button
-                className="confirm-button"
-                onClick={handleConfirm}
-              >
-                <CheckCircle2 size={18} />
-                Confirm Observation
-              </button>
+              <div className="confirmation-note"><strong>Current question</strong><p>{getQuestion(selectedTask) || "Questionnaire completed"}</p><span>Question {Math.min(selectedIndex + 1, selectedFields.length)} of {selectedFields.length}</span></div>
+              <label className="audio-zone">
+                <div className="mic-circle"><Mic size={28} /></div>
+                <strong>{audioFile ? audioFile.name : "Upload nurse recording"}</strong>
+                <span>Audio is transcribed and submitted automatically.</span>
+                <input type="file" accept="audio/*" hidden onChange={(event) => setAudioFile(event.target.files?.[0] || null)} />
+              </label>
+              <button className="primary-button" onClick={() => void handleAudioUpload()} disabled={!audioFile || status === "processing-audio" || selectedTask.status === "COMPLETED"}><Mic size={18} /> {status === "processing-audio" ? "Processing..." : "Submit Answer"}</button>
             </>
           )}
         </section>
       </div>
 
-      {status === "completed" &&
-        finalResult && (
-          <section className="result-panel">
-            <div className="result-heading">
-              <div>
-                <span className="eyebrow">
-                  Assessment Complete
-                </span>
-
-                <h2>
-                  Observation successfully stored
-                </h2>
-              </div>
-
-              <CheckCircle2
-                size={28}
-                className="success-icon"
-              />
-            </div>
-
-            <div className="parameter-display-grid">
-              {Object.entries(
-                finalResult.observation
-                  ?.clinical_parameters || {}
-              ).map(([key, value]) => (
-                <ParameterCard
-                  key={key}
-                  label={key}
-                  value={String(value)}
-                />
-              ))}
-            </div>
-
-            <div className="assessment-note">
-              Sepsis and AKI assessment agents have
-              processed the updated longitudinal
-              history. Trend and prioritization
-              analysis has also been triggered.
-            </div>
-          </section>
-        )}
+      {status === "question-ready" && <section className="result-panel"><strong>Answer recorded</strong><span>Next question loaded.</span></section>}
+      {status === "completed" && <section className="result-panel"><div className="result-heading"><div><span className="eyebrow">Questionnaire Complete</span><h2>Assessment started</h2></div><CheckCircle2 size={28} className="success-icon" /></div></section>}
     </div>
   );
 }
