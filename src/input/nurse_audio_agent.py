@@ -1,4 +1,5 @@
 import re
+from threading import Lock
 from typing import Optional
 
 from faster_whisper import WhisperModel
@@ -18,27 +19,29 @@ class NurseAudioAgent:
     """
 
     def __init__(self):
-        # CPU-friendly model for development/demo.
-        # Download occurs automatically on first use.
-        self.model = WhisperModel(
-            "small",
-            device="cpu",
-            compute_type="int8",
-        )
+        self.model: WhisperModel | None = None
+        self._transcription_lock = Lock()
 
     def transcribe(self, audio_path: str) -> str:
-        segments, _ = self.model.transcribe(
-            audio_path,
-            language="en",
-            beam_size=5,
-        )
+        with self._transcription_lock:
+            if self.model is None:
+                self.model = WhisperModel(
+                    "small",
+                    device="cpu",
+                    compute_type="int8",
+                )
+            segments, _ = self.model.transcribe(
+                audio_path,
+                language="en",
+                beam_size=5,
+            )
 
-        text = " ".join(
-            segment.text.strip()
-            for segment in segments
-        )
+            text = " ".join(
+                segment.text.strip()
+                for segment in segments
+            )
 
-        return text.strip()
+            return text.strip()
 
     @staticmethod
     def _find_number(
@@ -58,12 +61,82 @@ class NurseAudioAgent:
 
         return None
 
+    @staticmethod
+    def _normalize_spoken_numbers(text: str) -> str:
+        """Normalize common dictated vital-number phrases without inventing values."""
+        replacements = {
+            "one hundred and twenty": "120",
+            "one hundred twenty": "120",
+            "one twenty": "120",
+            "one hundred and ten": "110",
+            "one hundred ten": "110",
+            "one ten": "110",
+            "one hundred": "100",
+            "ninety": "90",
+            "eighty": "80",
+            "seventy": "70",
+            "sixty": "60",
+            "fifty": "50",
+            "forty": "40",
+            "thirty": "30",
+            "twenty": "20",
+            "one": "1",
+            "two": "2",
+            "three": "3",
+            "four": "4",
+            "five": "5",
+            "six": "6",
+            "seven": "7",
+            "eight": "8",
+            "nine": "9",
+            "point": ".",
+        }
+        normalized = text.lower()
+        for phrase, number in sorted(replacements.items(), key=lambda item: -len(item[0])):
+            normalized = re.sub(rf"\b{re.escape(phrase)}\b", number, normalized)
+        return normalized
+
+    @staticmethod
+    def _extract_wbc(text: str) -> Optional[float]:
+        """Extract one WBC result from numeric or naturally spoken numeric text."""
+        spoken_decimal = re.search(r"(?<![\w.])(\d+)\s*\.\s*(\d+)(?![\w.])", text)
+        if spoken_decimal:
+            return float(f"{spoken_decimal.group(1)}.{spoken_decimal.group(2)}")
+
+        numeric = re.search(r"(?<![\w.])\d+(?:\.\d+)?(?![\w.])", text)
+        if numeric:
+            return float(numeric.group(0))
+
+        return None
+
+    @staticmethod
+    def _extract_lactate(text: str) -> Optional[float]:
+        """Extract one lactate result from numeric or naturally spoken numeric text."""
+        lactate_context = re.search(
+            r"(?:lactate|lactic\s+acid)(?:\s+(?:result|level|value))?\s*(?:is|of|:)?\s*"
+            r"(\d+(?:\s*\.\s*\d+)?)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if lactate_context:
+            return float(re.sub(r"\s+", "", lactate_context.group(1)))
+
+        spoken_decimal = re.search(r"(?<![\w.])(\d+)\s*\.\s*(\d+)(?![\w.])", text)
+        if spoken_decimal:
+            return float(f"{spoken_decimal.group(1)}.{spoken_decimal.group(2)}")
+
+        numeric = re.search(r"(?<![\w.])\d+(?:\.\d+)?(?![\w.])", text)
+        if numeric:
+            return float(numeric.group(0))
+
+        return None
+
     def extract_parameters(
         self,
         transcript: str,
     ) -> dict:
 
-        text = transcript.lower()
+        text = self._normalize_spoken_numbers(transcript)
 
         parameters = {}
         metadata = {}
@@ -114,6 +187,18 @@ class NurseAudioAgent:
 
         if temp is not None:
             parameters["Temp"] = temp
+
+        # -------------------------
+        # WHITE BLOOD CELL COUNT
+        # -------------------------
+
+        wbc = (
+            self._extract_wbc(text)
+            if re.search(r"(?:\bwbc\b|white\s+blood\s+cell)", text, flags=re.IGNORECASE)
+            else None
+        )
+        if wbc is not None:
+            parameters["WBC"] = wbc
 
         # -------------------------
         # BLOOD PRESSURE
@@ -180,12 +265,10 @@ class NurseAudioAgent:
         # LACTATE
         # -------------------------
 
-        lactate = self._find_number(
-            text,
-            [
-                r"lactate\s*(?:result|level)?\s*(?:is|of|:)?\s*(\d+(?:\.\d+)?)",
-                r"lactic\s*acid\s*(?:is|of|:)?\s*(\d+(?:\.\d+)?)",
-            ],
+        lactate = (
+            self._extract_lactate(text)
+            if re.search(r"\b(?:lactate|lactic\s+acid)\b", text, flags=re.IGNORECASE)
+            else None
         )
 
         if lactate is not None:
@@ -209,6 +292,14 @@ class NurseAudioAgent:
             transcript
         )
 
+        no_value = bool(
+            re.search(
+                r"\b(?:none|no\s+value|not\s+available|unavailable|unknown)\b",
+                transcript,
+                flags=re.IGNORECASE,
+            )
+        )
+
         return {
             "status": "success",
             "source": "nurse_audio",
@@ -217,5 +308,6 @@ class NurseAudioAgent:
                 extraction["parameters"],
             "metadata":
                 extraction["metadata"],
+            "no_value": no_value,
             "requires_confirmation": True,
         }

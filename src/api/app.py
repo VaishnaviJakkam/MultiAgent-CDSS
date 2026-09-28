@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import shutil
 import tempfile
-import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +15,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from src.database.mongodb import MongoDatabase
-from src.database.repositories import PatientRepository
+from src.database.repositories import (
+    LabReportRepository,
+    PatientRepository,
+    WorkflowEventRepository,
+    WorkflowTaskRepository,
+)
+from src.database.workflow_tasks import TaskStatus
+from src.events import EventBus, EventType
 
 from src.agents.sepsis_agent import (
     SepsisDetectionAgent,
@@ -25,22 +32,35 @@ from src.agents.aki_agent import (
     AKIDetectionAgent,
 )
 
-from src.agents.gemini_planner import (
-    GeminiPlanner,
+from src.input.nurse_input_workflow import NurseInputSubmissionService, NurseInputReceivedEventHandler
+from src.input.nurse_audio_agent import NurseAudioAgent
+from src.input.input_orchestrator import InputOrchestrator
+from src.input.report_event_workflow import (
+    GenerateResultRequestService,
+    GenerateResultRequestedEventHandler,
+    LabReportSubmissionService,
+    ReportProcessingEventHandler,
 )
-
-from src.input.input_pipeline import (
-    SepsisWorkflowPipeline,
-)
+from src.agents.assessment_event_workflow import ObservationReadyAssessmentHandler
+from src.agents.trend_event_workflow import AssessmentCompletedTrendHandler
+from src.agents.risk_prioritization_event_workflow import TrendCompletedRiskPrioritizationHandler
+from src.agents.nurse_agent import NurseAgent
+from src.api.workflow_routes import WorkflowAPIContext, create_workflow_router
 
 
 # =========================================================
 # APP
 # =========================================================
 
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    nurse_input_service.set_audio_agent(NurseAudioAgent())
+    yield
+
 app = FastAPI(
     title="Multi-Agent Clinical Deterioration API",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 
@@ -61,41 +81,34 @@ app.add_middleware(
 # =========================================================
 
 database = MongoDatabase()
+repository = PatientRepository(database)
+report_repository = LabReportRepository(database)
+task_repository = WorkflowTaskRepository(database)
+event_repository = WorkflowEventRepository(database)
+event_bus = EventBus(event_repository)
+nurse_agent = NurseAgent()
 
-repository = PatientRepository(
-    database
+ReportProcessingEventHandler(report_repository, event_bus)
+GenerateResultRequestedEventHandler(
+    report_repository,
+    task_repository,
+    event_bus,
+    patient_repository=repository,
+    nurse_agent=nurse_agent,
 )
+NurseInputReceivedEventHandler(task_repository, report_repository, repository, event_bus)
+ObservationReadyAssessmentHandler(repository, event_bus)
+AssessmentCompletedTrendHandler(repository, event_bus)
+TrendCompletedRiskPrioritizationHandler(repository, event_bus)
 
-sepsis_agent = SepsisDetectionAgent(
-    model="advanced"
+report_submission_service = LabReportSubmissionService(report_repository, event_bus)
+generate_result_service = GenerateResultRequestService(report_repository, event_bus)
+nurse_input_service = NurseInputSubmissionService(
+    task_repository,
+    report_repository,
+    event_bus,
+    nurse_agent=nurse_agent,
 )
-
-aki_agent = AKIDetectionAgent()
-
-gemini_planner = GeminiPlanner()
-
-pipeline = SepsisWorkflowPipeline(
-    repository=repository,
-    sepsis_agent=sepsis_agent,
-    aki_agent=aki_agent,
-    gemini_planner=gemini_planner,
-)
-
-
-# =========================================================
-# PENDING INPUT STORE
-# =========================================================
-
-# Temporary workflow/session store.
-#
-# This is intentionally separate from the clinical
-# agent MongoDB collections.
-#
-# For the academic prototype this is sufficient.
-# Later it could become Redis / another persistent store.
-
-pending_inputs: dict[str, dict[str, Any]] = {}
-
 
 # =========================================================
 # REQUEST MODELS
@@ -103,6 +116,10 @@ pending_inputs: dict[str, dict[str, Any]] = {}
 
 class ConfirmationRequest(BaseModel):
     confirmed_parameters: dict[str, float]
+
+
+class NurseAnswerRequest(BaseModel):
+    provided_values: dict[str, Any]
 
 
 # =========================================================
@@ -336,12 +353,14 @@ def health():
 # REPORT UPLOAD
 # =========================================================
 
-@app.post("/api/input/report")
+@app.post("/api/legacy/input/report", include_in_schema=False)
 def upload_report(
     patient_id: str = Form(...),
     admission_id: str = Form(...),
     report: UploadFile = File(...),
 ):
+
+    raise HTTPException(status_code=410, detail="Use POST /api/reports")
 
     temporary_path = None
 
@@ -470,12 +489,15 @@ def upload_report(
 # =========================================================
 
 @app.post(
-    "/api/input/{input_id}/audio"
+    "/api/legacy/input/{input_id}/audio",
+    include_in_schema=False,
 )
 def upload_nurse_audio(
     input_id: str,
     audio: UploadFile = File(...),
 ):
+
+    raise HTTPException(status_code=410, detail="Use POST /api/nurse/tasks/{task_id}/audio")
 
     if input_id not in pending_inputs:
 
@@ -600,12 +622,15 @@ def upload_nurse_audio(
 # =========================================================
 
 @app.post(
-    "/api/input/{input_id}/confirm"
+    "/api/legacy/input/{input_id}/confirm",
+    include_in_schema=False,
 )
 def confirm_nurse_values(
     input_id: str,
     request: ConfirmationRequest,
 ):
+
+    raise HTTPException(status_code=410, detail="Use the persistent nurse task workflow")
 
     workflow = pending_inputs.get(
         input_id
@@ -1067,6 +1092,19 @@ def get_dashboard_patients():
 # =========================================================
 # SHUTDOWN
 # =========================================================
+
+app.include_router(
+    create_workflow_router(
+        WorkflowAPIContext(
+            repository=repository,
+            report_repository=report_repository,
+            task_repository=task_repository,
+            report_submission_service=report_submission_service,
+            generate_result_service=generate_result_service,
+            nurse_input_service=nurse_input_service,
+        )
+    )
+)
 
 @app.on_event("shutdown")
 def shutdown_event():

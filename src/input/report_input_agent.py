@@ -1,533 +1,186 @@
+from __future__ import annotations
+
 import re
-from pathlib import Path
 from typing import Optional
 
-import pytesseract
-from PIL import Image
 from rapidfuzz import fuzz
 
 
-# Windows Tesseract installation path
-pytesseract.pytesseract.tesseract_cmd = (
-    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-)
-
-
 class ReportInputAgent:
+    """OCR and complete structured extraction for uploaded laboratory reports."""
 
-    # Canonical name -> possible report names
     LAB_ALIASES = {
-        "WBC": [
-            "wbc",
-            "wbc count",
-            "total wbc count",
-            "total leucocyte count",
-            "total leukocyte count",
-            "tlc",
-        ],
-
-        "Hemoglobin": [
-            "haemoglobin",
-            "hemoglobin",
-            "hb",
-        ],
-
-        "RBC": [
-            "rbc",
-            "rbc count",
-            "total rbc count",
-        ],
-
-        "Hematocrit": [
-            "hematocrit",
-            "haematocrit",
-            "pcv",
-            "packed cell volume",
-        ],
-
-        "Platelets": [
-            "platelet count",
-            "platelets",
-        ],
-
-        "Neutrophils": [
-            "neutrophils",
-            "segmented neutrophils",
-        ],
-
-        "Lymphocytes": [
-            "lymphocytes",
-        ],
-
-        "Monocytes": [
-            "monocytes",
-        ],
-
-        "Eosinophils": [
-            "eosinophils",
-        ],
-
-        "Basophils": [
-            "basophils",
-        ],
-
-        "MCV": [
-            "mcv",
-            "mean corpuscular volume",
-        ],
-
-        "MCH": [
-            "mch",
-            "mean corpuscular hemoglobin",
-        ],
-
-        "MCHC": [
-            "mchc",
-            "mean corpuscular hemoglobin concentration",
-        ],
-
-        "RDW": [
-            "rdw",
-            "red cell distribution width",
-        ],
-
-        "Lactate": [
-            "lactate",
-            "blood lactate",
-            "serum lactate",
-            "lactic acid",
-        ],
-
-        "Creatinine": [
-            "creatinine",
-            "serum creatinine",
-        ],
-
-        "BUN": [
-            "bun",
-            "blood urea nitrogen",
-        ],
-
-        "Urea": [
-            "urea",
-            "blood urea",
-            "serum urea",
-        ],
-
-        "Sodium": [
-            "sodium",
-            "serum sodium",
-        ],
-
-        "Potassium": [
-            "potassium",
-            "serum potassium",
-        ],
-
-        "Bilirubin": [
-            "bilirubin",
-            "total bilirubin",
-        ],
-
-        "CRP": [
-            "crp",
-            "c reactive protein",
-            "c-reactive protein",
-        ],
-
-        "ESR": [
-            "esr",
-            "erythrocyte sedimentation rate",
-        ],
+        "BaseExcess": ["baseexcess", "base excess", "base excess be"],
+        "HCO3": ["hco3", "bicarbonate", "bicarbonate hco3"],
+        "FiO2": ["fio2", "fi o2", "fraction of inspired oxygen"],
+        "pH": ["ph", "p h"],
+        "PaCO2": ["paco2", "pa co2", "partial pressure of carbon dioxide"],
+        "SaO2": ["sao2", "sa o2", "arterial oxygen saturation"],
+        "AST": ["ast", "aspartate aminotransferase", "sgot"],
+        "Alkalinephos": ["alkalinephos", "alkaline phos", "alkaline phosphatase", "alp"],
+        "Calcium": ["calcium", "serum calcium"],
+        "Chloride": ["chloride", "serum chloride"],
+        "Creatinine": ["creatinine", "serum creatinine"],
+        "Bilirubin_direct": ["bilirubin direct", "direct bilirubin"],
+        "Glucose": ["glucose", "blood glucose", "blood sugar"],
+        "Lactate": ["lactate", "blood lactate", "serum lactate", "lactic acid"],
+        "Magnesium": ["magnesium", "serum magnesium"],
+        "Phosphate": ["phosphate", "phosphorus", "serum phosphate"],
+        "Potassium": ["potassium", "serum potassium"],
+        "Sodium": ["sodium", "serum sodium"],
+        "Bilirubin_total": ["bilirubin total", "total bilirubin"],
+        "TroponinI": ["troponini", "troponin i", "troponin"],
+        "Hct": ["hct", "hematocrit", "haematocrit", "pcv", "packed cell volume"],
+        "Hgb": ["hgb", "hb", "hemoglobin", "haemoglobin"],
+        "PTT": ["ptt", "partial thromboplastin time"],
+        "WBC": ["wbc", "wbc count", "total wbc count", "total leucocyte count", "total leukocyte count", "tlc"],
+        "Fibrinogen": ["fibrinogen"],
+        "Temp": ["temp", "temperature", "body temperature"],
+        "SBP": ["sbp", "systolic blood pressure", "blood pressure systolic"],
+        "BP": ["bp", "blood pressure"],
+        "MAP": ["map", "mean arterial pressure"],
+        "DBP": ["dbp", "diastolic blood pressure", "blood pressure diastolic"],
+        "Resp": ["resp", "resp rate", "respiratory rate", "respiration rate"],
+        "ETCO2": ["etco2", "et co2", "end tidal carbon dioxide"],
+        "HR": ["hr", "heart rate", "heartrate", "pulse", "pulse rate"],
+        "O2Sat": ["o2sat", "o2 sat", "spo2", "oxygen saturation", "oxygen sat"],
+        "Platelets": ["platelet count", "platelets"],
+        "RBC": ["rbc", "rbc count", "total rbc count"],
+        "MCV": ["mcv", "mean corpuscular volume"],
+        "MCH": ["mch", "mean corpuscular hemoglobin"],
+        "MCHC": [" mchc", "mean corpuscular hemoglobin concentration"],
+        "RDW": ["rdw", "red cell distribution width"],
+        "Urea": ["urea", "blood urea", "serum urea"],
+        "CRP": ["crp", "c reactive protein", "c-reactive protein"],
+        "ESR": ["esr", "erythrocyte sedimentation rate"],
     }
 
-    SEPSIS_REQUIRED_FEATURES = [
-        "HR",
-        "O2Sat",
-        "Temp",
-        "SBP",
-        "MAP",
-        "Resp",
-        "WBC",
-        "Lactate",
-    ]
-
-    def extract_text(self, image_path: str) -> str:
-        path = Path(image_path)
-
-        if not path.exists():
-            raise FileNotFoundError(
-                f"Report not found: {image_path}"
-            )
-
-        image = Image.open(path)
-
-        text = pytesseract.image_to_string(
-            image,
-            lang="eng",
-            config="--psm 6",
-        )
-
-        return text
+    SEPSIS_REQUIRED_FEATURES = ["HR", "O2Sat", "Temp", "SBP", "MAP", "Resp", "WBC", "Lactate"]
 
     @staticmethod
     def _clean_line(line: str) -> str:
-        line = line.replace("|", " ")
-        line = re.sub(r"\s+", " ", line)
-
-        return line.strip()
+        return re.sub(r"\s+", " ", line.replace("|", " ")).strip()
 
     @staticmethod
     def _clean_label(text: str) -> str:
-        text = text.lower()
+        return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s\-]", " ", text.lower())).strip()
 
-        text = re.sub(
-            r"[^a-z\s\-]",
-            " ",
-            text,
-        )
-
-        text = re.sub(
-            r"\s+",
-            " ",
-            text,
-        )
-
-        return text.strip()
-
-    def _canonical_parameter(
-        self,
-        possible_label: str,
-    ) -> Optional[str]:
-
-        label = self._clean_label(
-            possible_label
-        )
-
+    def _canonical_parameter(self, possible_label: str) -> Optional[str]:
+        label = self._clean_label(possible_label)
         if not label:
             return None
-
-        best_parameter = None
+        best_parameter: str | None = None
         best_score = 0
-
         for canonical, aliases in self.LAB_ALIASES.items():
-
             for alias in aliases:
-
-                alias_clean = self._clean_label(
-                    alias
-                )
-
-                # Exact label match
+                alias_clean = self._clean_label(alias)
                 if label == alias_clean:
                     return canonical
-
-                # Whole-string fuzzy matching
-                score = fuzz.ratio(
-                    label,
-                    alias_clean,
-                )
-
+                score = fuzz.ratio(label, alias_clean)
                 if score > best_score:
-                    best_score = score
-                    best_parameter = canonical
-
-        # Handles common OCR mistakes such as:
-        # WBC -> WAC
-        # MCV -> MEV
-        # PCV -> POV
-        # RDW -> ROW
-        if best_score >= 75:
-            return best_parameter
-
-        return None
+                    best_parameter, best_score = canonical, score
+        return best_parameter if best_score >= 75 else None
 
     @staticmethod
-    def _extract_numbers(
-        line: str,
-    ) -> list[float]:
-
-        matches = re.findall(
-            r"(?<![\w.])-?\d+(?:\.\d+)?",
-            line,
-        )
-
-        values = []
-
-        for value in matches:
-            try:
-                values.append(
-                    float(value)
-                )
-            except ValueError:
-                continue
-
-        return values
+    def _extract_numbers(text: str) -> list[float]:
+        pattern = r"(?<![\w.])[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+        return [float(value) for value in re.findall(pattern, text)]
 
     @staticmethod
-    def _extract_unit(
-        text: str,
-    ) -> Optional[str]:
-
-        unit_patterns = [
-            r"x\s*10\^?3\s*/\s*[uµ]l",
-            r"10\^?3\s*/\s*[uµ]l",
-            r"mmol\s*/\s*l",
-            r"mg\s*/\s*dl",
-            r"g\s*/\s*dl",
-            r"thou\s*/\s*mm3",
-            r"thou\s*/\s*mm³",
-            r"/\s*cu\.?\s*mm",
-            r"/\s*cumm",
-            r"cells\s*/\s*[uµ]l",
-            r"mill\s*/\s*mm3",
-            r"mm\s*/\s*hr",
-            r"\%",
-            r"\bfl\b",
-            r"\bpg\b",
-        ]
-
-        for pattern in unit_patterns:
-
-            match = re.search(
-                pattern,
-                text,
-                flags=re.IGNORECASE,
-            )
-
-            if match:
-                return match.group(0)
-
-        return None
+    def _extract_value(text: str) -> float | None:
+        values = ReportInputAgent._extract_numbers(text)
+        return values[0] if values else None
 
     @staticmethod
-    def _normalize_value(
-        parameter: str,
-        value: float,
-        unit: Optional[str],
-    ) -> float:
+    def _extract_unit(text: str) -> Optional[str]:
+        return text.strip() or None
 
-        if parameter == "WBC":
-
-            unit_text = (
-                unit or ""
-            ).lower()
-
-            # Example:
-            # 5500 /cu.mm -> 5.5
-            # 9000 /cumm -> 9.0
-            if (
-                "cu" in unit_text
-                or "cumm" in unit_text
-                or "cells" in unit_text
-            ):
-
-                if value > 100:
-                    return round(
-                        value / 1000.0,
-                        3,
-                    )
-
-            # Example:
-            # 4.20 thou/mm3
-            # already represented as 4.20
-            if "thou" in unit_text:
-                return round(
-                    value,
-                    3,
-                )
-
-            # OCR may lose the unit completely.
-            # If value clearly resembles an absolute WBC count,
-            # normalize carefully.
-            if (
-                unit is None
-                and 1000 <= value <= 100000
-            ):
-                return round(
-                    value / 1000.0,
-                    3,
-                )
-
+    @staticmethod
+    def _normalize_value(parameter: str, value: float, unit: Optional[str]) -> float:
+        if parameter == "WBC" and value > 100 and unit and any(token in unit.lower() for token in ("cu", "cumm", "cells")):
+            return round(value / 1000.0, 3)
+        if parameter == "WBC" and value > 1000 and unit is None:
+            return round(value / 1000.0, 3)
         return value
 
-    def extract_lab_results(
-        self,
-        text: str,
-    ) -> dict:
+    def _entry(self, parameter: str, source_name: str, value: float | None, unit: Optional[str], line: str) -> dict:
+        return {
+            "canonical_name": parameter,
+            "source_name": source_name,
+            "value": self._normalize_value(parameter, value, unit) if value is not None else None,
+            "raw_value": value,
+            "unit": unit,
+            "raw_line": line,
+        }
 
-        results = {}
+    @staticmethod
+    def _fallback_parameter_name(source_name: str) -> str | None:
+        cleaned = re.sub(r"[^A-Za-z0-9]+", "_", source_name).strip("_")
+        return cleaned or None
 
-        lines = []
+    def extract_lab_results(self, text: str) -> dict:
+        results: dict[str, dict] = {}
+        value_pattern = r"(?<![\w.])[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?|\bnull\b"
 
-        for line in text.splitlines():
-
-            cleaned = self._clean_line(
-                line
-            )
-
-            if cleaned:
-                lines.append(
-                    cleaned
-                )
-
-        for line in lines:
-
-            # First number in the line is assumed
-            # to be the reported result.
-            number_match = re.search(
-                r"-?\d+(?:\.\d+)?",
-                line,
-            )
-
-            if not number_match:
+        for raw_line in text.splitlines():
+            line = self._clean_line(raw_line)
+            if not line:
                 continue
+            cells = [cell.strip() for cell in raw_line.split("|")]
+            table_row = len(cells) >= 2
+            if table_row:
+                label = cells[0]
+                value_text = cells[1]
+                unit = cells[2] if len(cells) >= 3 and cells[2] else None
+            else:
+                match = re.search(value_pattern, line, flags=re.IGNORECASE)
+                if not match:
+                    continue
+                label = line[:match.start()].strip()
+                value_text = match.group(0)
+                unit = self._extract_unit(line[match.end():])
 
-            label_part = line[
-                :number_match.start()
-            ].strip()
-
-            parameter = (
-                self._canonical_parameter(
-                    label_part
-                )
-            )
-
+            parameter = self._canonical_parameter(label)
+            if parameter is None:
+                parameter = self._fallback_parameter_name(label)
             if parameter is None:
                 continue
-
-            values = self._extract_numbers(
-                line
-            )
-
-            if not values:
+            is_null = value_text.lower() == "null"
+            value = None if is_null else self._extract_value(value_text)
+            if value is None and not is_null:
                 continue
 
-            raw_value = values[0]
+            if parameter == "BP" and not table_row and re.search(r"/|\bover\b", line, flags=re.IGNORECASE):
+                values = self._extract_numbers(line)
+                if len(values) >= 2:
+                    results["SBP"] = self._entry("SBP", label, values[0], unit, line)
+                    results["DBP"] = self._entry("DBP", label, values[1], unit, line)
+                    results["MAP"] = self._entry("MAP", label, round((values[0] + 2 * values[1]) / 3, 2), unit, line)
+                    continue
 
-            # Only inspect text immediately after
-            # the result for a unit.
-            after_result = line[
-                number_match.end():
-            ]
-
-            next_number = re.search(
-                r"-?\d+(?:\.\d+)?",
-                after_result,
-            )
-
-            if next_number:
-                result_context = (
-                    after_result[
-                        :next_number.start()
-                    ]
-                )
-            else:
-                result_context = (
-                    after_result
-                )
-
-            unit = self._extract_unit(
-                result_context
-            )
-
-            normalized_value = (
-                self._normalize_value(
-                    parameter,
-                    raw_value,
-                    unit,
-                )
-            )
-
-            results[parameter] = {
-                "value":
-                    normalized_value,
-
-                "raw_value":
-                    raw_value,
-
-                "unit":
-                    unit,
-
-                "raw_line":
-                    line,
-            }
+            results[parameter] = self._entry(parameter, label, value, unit, line)
 
         return results
 
-    def get_sepsis_parameters(
-        self,
-        lab_results: dict,
-    ) -> dict:
-
-        sepsis_parameters = {}
-
-        for feature in [
-            "WBC",
-            "Lactate",
-        ]:
-
-            if feature in lab_results:
-
-                sepsis_parameters[
-                    feature
-                ] = lab_results[
-                    feature
-                ]["value"]
-
-        return sepsis_parameters
-
-    def analyze(
-        self,
-        image_path: str,
-    ) -> dict:
-
-        raw_text = self.extract_text(
-            image_path
-        )
-
-        lab_results = (
-            self.extract_lab_results(
-                raw_text
-            )
-        )
-
-        sepsis_parameters = (
-            self.get_sepsis_parameters(
-                lab_results
-            )
-        )
-
-        missing = [
-            feature
-            for feature
-            in self.SEPSIS_REQUIRED_FEATURES
-            if feature
-            not in sepsis_parameters
-        ]
-
-        status = (
-            "success"
-            if not missing
-            else "partial"
-        )
-
+    def get_sepsis_parameters(self, lab_results: dict) -> dict:
         return {
-            "status":
-                status,
+            feature: lab_results[feature]["value"]
+            for feature in self.SEPSIS_REQUIRED_FEATURES
+            if feature in lab_results
+        }
 
-            "source":
-                "lab_report",
-
-            "lab_results":
-                lab_results,
-
-            "sepsis_parameters":
-                sepsis_parameters,
-
-            "missing_sepsis_parameters":
-                missing,
-
-            "raw_text":
-                raw_text,
+    def analyze(self, raw_text: str) -> dict:
+        if not isinstance(raw_text, str) or not raw_text.strip():
+            raise ValueError("Report extraction received no raw text")
+        lab_results = self.extract_lab_results(raw_text)
+        sepsis_parameters = self.get_sepsis_parameters(lab_results)
+        missing = [feature for feature in self.SEPSIS_REQUIRED_FEATURES if feature not in sepsis_parameters]
+        return {
+            "status": "success" if not missing else "partial",
+            "source": "lab_report",
+            "lab_results": lab_results,
+            "extracted_data": lab_results,
+            "sepsis_parameters": sepsis_parameters,
+            "missing_sepsis_parameters": missing,
+            "raw_text": raw_text,
         }

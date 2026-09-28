@@ -6,6 +6,7 @@ from typing import Any
 from src.database.repositories import PatientRepository
 
 from src.input.report_input_agent import ReportInputAgent
+from src.input.document_text_extractor import DocumentTextExtractor
 from src.input.nurse_audio_agent import NurseAudioAgent
 from src.input.input_orchestrator import InputOrchestrator
 from src.input.data_processing_agent import DataProcessingAgent
@@ -47,6 +48,7 @@ class SepsisWorkflowPipeline:
         self.repository = repository
 
         self.report_agent = ReportInputAgent()
+        self.text_extractor = DocumentTextExtractor()
         self.audio_agent = NurseAudioAgent()
         self.orchestrator = InputOrchestrator()
         self.processor = DataProcessingAgent()
@@ -72,7 +74,10 @@ class SepsisWorkflowPipeline:
     ) -> dict[str, Any]:
 
         report_result = self.report_agent.analyze(
-            report_path
+            self.text_extractor.extract(
+                report_path,
+                filename=report_path,
+            )
         )
 
         nurse_request = (

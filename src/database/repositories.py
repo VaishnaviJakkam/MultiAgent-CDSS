@@ -30,12 +30,22 @@ class _InMemoryCollection:
 
     def find_one(self, query: dict[str, Any]) -> dict[str, Any] | None:
         for document in self.documents:
-            if all(document.get(key) == value for key, value in query.items()):
+            if self._matches(document, query):
                 return deepcopy(document)
         return None
 
     def find(self, query: dict[str, Any]) -> list[dict[str, Any]]:
-        return [deepcopy(document) for document in self.documents if all(document.get(key) == value for key, value in query.items())]
+        return [deepcopy(document) for document in self.documents if self._matches(document, query)]
+
+    @staticmethod
+    def _matches(document: dict[str, Any], query: dict[str, Any]) -> bool:
+        for key, value in query.items():
+            if isinstance(value, dict) and "$in" in value:
+                if document.get(key) not in value["$in"]:
+                    return False
+            elif document.get(key) != value:
+                return False
+        return True
 
     def update_one(self, query: dict[str, Any], update: dict[str, Any]) -> _UpdateResult:
         for document in self.documents:
@@ -215,8 +225,22 @@ class WorkflowTaskRepository:
     def get_pending_tasks(self) -> list[dict[str, Any]]:
         from .workflow_tasks import TaskStatus
 
-        records = self.tasks.find({"status": TaskStatus.PENDING.value})
+        records = self.tasks.find({"status": {"$in": [TaskStatus.PENDING.value, TaskStatus.IN_PROGRESS.value]}})
         return sorted(records, key=lambda item: item["created_at"])
+
+    def start_task(self, task_id: str) -> dict[str, Any]:
+        from .workflow_tasks import TaskStatus
+
+        task = self.get_task(task_id)
+        if task is None:
+            raise ValueError(f"Task not found: {task_id}")
+        if task["status"] == TaskStatus.COMPLETED.value:
+            return task
+        if task["status"] == TaskStatus.CANCELLED.value:
+            raise ValueError(f"Task is already {task['status']}")
+        if task["status"] == TaskStatus.PENDING.value:
+            return self.update_task(task_id, status=TaskStatus.IN_PROGRESS)
+        return task
 
     def get_patient_tasks(self, patient_id: str, admission_id: str) -> list[dict[str, Any]]:
         scope = self._scope(patient_id, admission_id)
@@ -274,6 +298,7 @@ class LabReportRepository:
         source: Any = "LAB_UPLOAD",
         processing_status: Any = "UPLOADED",
         extracted_data: dict[str, Any] | None = None,
+        raw_text: str = "",
         metadata: dict[str, Any] | None = None,
         report_id: str | None = None,
         uploaded_at: datetime | None = None,
@@ -311,6 +336,7 @@ class LabReportRepository:
             "storage_reference": storage_reference,
             "processing_status": self._enum_value(processing_status, ReportProcessingStatus, "processing_status"),
             "extracted_data": deepcopy(extracted_data or {}),
+            "raw_text": raw_text,
             "metadata": deepcopy(metadata or {}),
             "created_at": now,
             "updated_at": now,
@@ -330,7 +356,7 @@ class LabReportRepository:
         if updates is not None and not isinstance(updates, dict):
             raise ValueError("updates must be a dictionary")
         pending_changes = {**(updates or {}), **changes}
-        allowed = {"report_date", "source", "filename", "content_type", "storage_reference", "processing_status", "extracted_data", "metadata"}
+        allowed = {"report_date", "source", "filename", "content_type", "storage_reference", "processing_status", "extracted_data", "raw_text", "metadata"}
         unexpected = set(pending_changes) - allowed
         if unexpected:
             raise ValueError(f"unsupported report fields: {sorted(unexpected)}")
@@ -345,6 +371,8 @@ class LabReportRepository:
                 if not isinstance(pending_changes[field_name], dict):
                     raise ValueError(f"{field_name} must be a dictionary")
                 pending_changes[field_name] = deepcopy(pending_changes[field_name])
+        if "raw_text" in pending_changes and not isinstance(pending_changes["raw_text"], str):
+            raise ValueError("raw_text must be a string")
         for field_name in ("filename", "content_type"):
             if field_name in pending_changes:
                 if not isinstance(pending_changes[field_name], str) or not pending_changes[field_name].strip():
@@ -469,6 +497,11 @@ class PatientRepository:
     def get_observation_by_task(self, patient_id: str, admission_id: str, task_id: str) -> dict[str, Any] | None:
         scope = self._scope(patient_id, admission_id)
         scope["task_id"] = require_identifier(task_id, "task_id")
+        return self.observations.find_one(scope)
+
+    def get_observation_by_report(self, patient_id: str, admission_id: str, report_id: str) -> dict[str, Any] | None:
+        scope = self._scope(patient_id, admission_id)
+        scope["report_id"] = require_identifier(report_id, "report_id")
         return self.observations.find_one(scope)
 
     def get_observation(self, patient_id: str, admission_id: str, observation_id: str) -> dict[str, Any] | None:

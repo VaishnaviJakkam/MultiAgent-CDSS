@@ -5,9 +5,13 @@ from datetime import datetime
 from typing import Any
 
 from src.database.lab_reports import ReportProcessingStatus
-from src.database.repositories import LabReportRepository, WorkflowTaskRepository
+from src.database.repositories import LabReportRepository, PatientRepository, WorkflowTaskRepository
 from src.events import EventBus, EventType, WorkflowEvent
+from src.input.data_processing_agent import DataProcessingAgent
+from src.input.deepseek_report_extractor import DeepSeekReportExtractor
+from src.input.document_text_extractor import DocumentTextExtractor
 from src.input.input_orchestrator import InputOrchestrator
+from src.agents.nurse_agent import NurseAgent
 
 
 class LabReportSubmissionService:
@@ -29,6 +33,8 @@ class LabReportSubmissionService:
         metadata: dict[str, Any] | None = None,
         report_id: str | None = None,
         uploaded_at: datetime | None = None,
+        extracted_data: dict[str, Any] | None = None,
+        raw_text: str = "",
     ) -> dict[str, Any]:
         report = self.repository.create_report(
             patient_id=patient_id,
@@ -41,6 +47,9 @@ class LabReportSubmissionService:
             metadata=metadata,
             report_id=report_id,
             uploaded_at=uploaded_at,
+            processing_status=(ReportProcessingStatus.PROCESSED if extracted_data is not None else ReportProcessingStatus.UPLOADED),
+            extracted_data=extracted_data,
+            raw_text=raw_text,
         )
         event = WorkflowEvent(
             event_type=EventType.REPORT_UPLOADED,
@@ -54,6 +63,20 @@ class LabReportSubmissionService:
             },
         )
         self.event_bus.publish(event)
+        if extracted_data is not None:
+            self.event_bus.publish(
+                WorkflowEvent(
+                    event_type=EventType.REPORT_PROCESSED,
+                    patient_id=report["patient_id"],
+                    admission_id=report["admission_id"],
+                    related_report_id=report["report_id"],
+                    payload={
+                        "report_id": report["report_id"],
+                        "processing_status": ReportProcessingStatus.PROCESSED.value,
+                        "extracted_fields": sorted(extracted_data),
+                    },
+                )
+            )
         return report
 
 
@@ -95,11 +118,8 @@ class ReportProcessingEventHandler:
     ) -> None:
         self.repository = repository
         self.event_bus = event_bus
-        if report_agent is None:
-            from src.input.report_input_agent import ReportInputAgent
-
-            report_agent = ReportInputAgent()
         self.report_agent = report_agent
+        self.text_extractor = DocumentTextExtractor()
         self.event_bus.subscribe(EventType.REPORT_UPLOADED, self.handle)
 
     def handle(self, event: WorkflowEvent) -> dict[str, Any] | None:
@@ -125,8 +145,17 @@ class ReportProcessingEventHandler:
             if not storage_reference:
                 raise ValueError("Lab report has no storage_reference")
 
-            result = self.report_agent.analyze(storage_reference)
-            extracted_data = result.get("lab_results", result)
+            if self.report_agent is None:
+                raw_text = self.text_extractor.extract(
+                    storage_reference,
+                    filename=processing["filename"],
+                    content_type=processing["content_type"],
+                )
+                extracted_data = DeepSeekReportExtractor().extract(raw_text)
+                result = {"extracted_data": extracted_data, "raw_text": raw_text}
+            else:
+                result = self.report_agent.analyze(storage_reference)
+            extracted_data = result.get("extracted_data") or result.get("lab_results") or {}
             if not isinstance(extracted_data, dict):
                 raise ValueError("Report extraction did not return structured lab results")
 
@@ -134,6 +163,7 @@ class ReportProcessingEventHandler:
                 report_id,
                 processing_status=ReportProcessingStatus.PROCESSED,
                 extracted_data=extracted_data,
+                raw_text=str(result.get("raw_text", "")),
             )
             self.event_bus.publish(
                 WorkflowEvent(
@@ -171,11 +201,17 @@ class GenerateResultRequestedEventHandler:
         task_repository: WorkflowTaskRepository,
         event_bus: EventBus,
         input_orchestrator: InputOrchestrator | None = None,
+        patient_repository: PatientRepository | None = None,
+        data_processor: DataProcessingAgent | None = None,
+        nurse_agent: NurseAgent | None = None,
     ) -> None:
         self.report_repository = report_repository
         self.task_repository = task_repository
+        self.patient_repository = patient_repository or PatientRepository(report_repository.database)
         self.event_bus = event_bus
         self.input_orchestrator = input_orchestrator or InputOrchestrator()
+        self.data_processor = data_processor or DataProcessingAgent()
+        self.nurse_agent = nurse_agent or NurseAgent()
         self.event_bus.subscribe(EventType.GENERATE_RESULT_REQUESTED, self.handle)
 
     def handle(self, event: WorkflowEvent) -> dict[str, Any] | None:
@@ -194,10 +230,44 @@ class GenerateResultRequestedEventHandler:
         nurse_request = self.input_orchestrator.create_nurse_request(report_result)
         provided_fields = sorted(report_result["sepsis_parameters"])
 
-        if nurse_request["status"] == "complete":
-            return self._publish_ready(report)
+        decision = self.nurse_agent.decide(
+            patient_id=report["patient_id"],
+            admission_id=report["admission_id"],
+            lab_values=report_result["sepsis_parameters"],
+            nurse_values={},
+            current_task_state={"status": "PENDING", "report_id": report["report_id"]},
+        )
 
-        existing_task = self._find_pending_task(report)
+        if decision.action == "COMPLETE":
+            existing_observation = self.patient_repository.get_observation_by_report(
+                report["patient_id"],
+                report["admission_id"],
+                report["report_id"],
+            )
+            if existing_observation is not None:
+                self._publish_ready(report, existing_observation)
+                return existing_observation
+            observation = self.data_processor.process(
+                patient_id=report["patient_id"],
+                admission_id=report["admission_id"],
+                report_result=report_result,
+                observation_time=datetime.now().astimezone(),
+            )
+            if not observation["ready_for_sepsis_assessment"]:
+                raise ValueError(f"Missing clinical parameters: {observation['missing_sepsis_parameters']}")
+            stored_observation = self.patient_repository.add_observation(
+                patient_id=report["patient_id"],
+                admission_id=report["admission_id"],
+                observation_time=observation["observation_time"],
+                clinical_parameters=observation["clinical_parameters"],
+                source="lab_report",
+                report_id=report["report_id"],
+                parameter_sources=observation["parameter_sources"],
+            )
+            self._publish_ready(report, stored_observation)
+            return stored_observation
+
+        existing_task = self._find_task(report)
         if existing_task is not None:
             self._publish_nurse_required(report, existing_task, nurse_request, allow_duplicate=False)
             return existing_task
@@ -212,9 +282,10 @@ class GenerateResultRequestedEventHandler:
                 "report_id": report["report_id"],
                 "missing_model_features": nurse_request["missing_model_features"],
                 "request_message": nurse_request["message"],
-                "question_fields": nurse_request["requested_nurse_fields"],
+                "question_fields": [decision.parameter],
                 "question_index": 0,
                 "answers": {},
+                "nurse_agent_decision": decision.as_dict(),
             },
         )
         self._publish_nurse_required(report, task, nurse_request, allow_duplicate=False)
@@ -231,7 +302,7 @@ class GenerateResultRequestedEventHandler:
                 sepsis_parameters[parameter] = value
         return {"sepsis_parameters": sepsis_parameters}
 
-    def _find_pending_task(self, report: dict[str, Any]) -> dict[str, Any] | None:
+    def _find_task(self, report: dict[str, Any]) -> dict[str, Any] | None:
         from src.database.workflow_tasks import TaskStatus, TaskType
 
         tasks = self.task_repository.get_patient_tasks(
@@ -241,7 +312,11 @@ class GenerateResultRequestedEventHandler:
         for task in tasks:
             if (
                 task["task_type"] == TaskType.NURSE_INPUT.value
-                and task["status"] == TaskStatus.PENDING.value
+                and task["status"] in {
+                    TaskStatus.PENDING.value,
+                    TaskStatus.IN_PROGRESS.value,
+                    TaskStatus.COMPLETED.value,
+                }
                 and task.get("metadata", {}).get("report_id") == report["report_id"]
             ):
                 return task
@@ -307,7 +382,7 @@ class GenerateResultRequestedEventHandler:
             "question": f"Please provide {display_name}." if display_name else nurse_request["message"],
         }
 
-    def _publish_ready(self, report: dict[str, Any]) -> dict[str, Any]:
+    def _publish_ready(self, report: dict[str, Any], observation: dict[str, Any]) -> None:
         if not self._event_exists(EventType.OBSERVATION_READY, report):
             self.event_bus.publish(
                 WorkflowEvent(
@@ -317,12 +392,12 @@ class GenerateResultRequestedEventHandler:
                     related_report_id=report["report_id"],
                     payload={
                         "report_id": report["report_id"],
+                        "observation_id": observation["observation_id"],
                         "processing_status": report["processing_status"],
                         "available_fields": sorted(report.get("extracted_data", {})),
                     },
                 )
             )
-            return report
 
 
 ReportProcessedEventHandler = GenerateResultRequestedEventHandler

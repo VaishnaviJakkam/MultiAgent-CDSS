@@ -7,8 +7,11 @@ import {
 import {
   Activity,
   AlertTriangle,
+  ArrowRight,
+  BedDouble,
   HeartPulse,
   RefreshCw,
+  Search,
   TrendingDown,
   TrendingUp,
   Minus,
@@ -25,11 +28,17 @@ import {
 } from "recharts";
 
 import {
+  useNavigate,
   useSearchParams,
 } from "react-router-dom";
 
 import {
+  getDashboardPatients,
   getPatientHistory,
+} from "../api/clinicalApi";
+
+import type {
+  PatientSummary,
 } from "../api/clinicalApi";
 
 import MetricCard from "../components/MetricCard";
@@ -109,6 +118,8 @@ const TREND_OPTIONS: TrendOption[] = [
 
 
 export default function DoctorDashboard() {
+  const navigate = useNavigate();
+
   const [searchParams] =
     useSearchParams();
 
@@ -121,6 +132,18 @@ export default function DoctorDashboard() {
     searchParams.get(
       "admission_id"
     );
+
+  const [patients, setPatients] =
+    useState<PatientSummary[]>([]);
+
+  const [patientSearch, setPatientSearch] =
+    useState("");
+
+  const [patientListLoading, setPatientListLoading] =
+    useState(true);
+
+  const [patientListError, setPatientListError] =
+    useState("");
 
 
   const [
@@ -164,7 +187,6 @@ export default function DoctorDashboard() {
     useState<ClinicalParameter>(
       "HR"
     );
-
 
   async function loadHistory(
     patient: string = patientId,
@@ -216,6 +238,31 @@ export default function DoctorDashboard() {
    */
   useEffect(
     () => {
+      async function loadPatients() {
+        try {
+          setPatientListLoading(true);
+          setPatientListError("");
+          const result = await getDashboardPatients();
+          setPatients(result.patients || []);
+        } catch (error) {
+          setPatientListError(
+            error instanceof Error
+              ? error.message
+              : "Could not load patients."
+          );
+        } finally {
+          setPatientListLoading(false);
+        }
+      }
+
+      void loadPatients();
+    },
+    []
+  );
+
+
+  useEffect(
+    () => {
       if (
         queryPatientId &&
         queryAdmissionId
@@ -239,6 +286,39 @@ export default function DoctorDashboard() {
       queryAdmissionId,
     ]
   );
+
+
+  const filteredPatients =
+    useMemo(
+      () => {
+        const search = patientSearch.trim().toLowerCase();
+        const priorityOrder: Record<string, number> = {
+          HIGH: 0,
+          MEDIUM: 1,
+          LOW: 2,
+          PENDING: 3,
+        };
+
+        return [...patients]
+          .filter((patient) =>
+            patient.patient_id
+              .toLowerCase()
+              .includes(search)
+          )
+          .sort((a, b) => {
+            const priorityDifference =
+              (priorityOrder[String(a.priority?.level || "PENDING").toUpperCase()] ?? 3) -
+              (priorityOrder[String(b.priority?.level || "PENDING").toUpperCase()] ?? 3);
+
+            if (priorityDifference !== 0) {
+              return priorityDifference;
+            }
+
+            return (b.sepsis?.probability || 0) - (a.sepsis?.probability || 0);
+          });
+      },
+      [patients, patientSearch]
+    );
 
 
   /*
@@ -624,6 +704,215 @@ export default function DoctorDashboard() {
       <Minus
         size={30}
       />
+    );
+  }
+
+
+  if (!queryPatientId || !queryAdmissionId) {
+    return (
+      <div className="doctor-patient-list-page">
+        <style>
+          {`
+            .doctor-patient-list-page {
+              min-height: 100%;
+              padding: 34px;
+              background: #f6f8fb;
+              color: #132238;
+            }
+
+            .doctor-patient-list-header {
+              margin-bottom: 22px;
+            }
+
+            .doctor-patient-list-header h1 {
+              margin: 0;
+              color: #102039;
+              font-size: 30px;
+            }
+
+            .doctor-patient-search {
+              position: relative;
+              margin-bottom: 18px;
+            }
+
+            .doctor-patient-search svg {
+              position: absolute;
+              left: 14px;
+              top: 50%;
+              transform: translateY(-50%);
+              color: #8792a3;
+            }
+
+            .doctor-patient-search input {
+              width: 100%;
+              box-sizing: border-box;
+              border: 1px solid #dfe7f1;
+              border-radius: 10px;
+              padding: 13px 14px 13px 42px;
+              background: white;
+              color: #132238;
+              font: inherit;
+            }
+
+            .doctor-patient-list {
+              margin: 0;
+              padding-left: 34px;
+              display: grid;
+              gap: 10px;
+            }
+
+            .doctor-patient-list li {
+              padding-left: 8px;
+            }
+
+            .doctor-patient-row {
+              width: 100%;
+              box-sizing: border-box;
+              display: flex;
+              align-items: center;
+              justify-content: space-between;
+              gap: 18px;
+              border: 1px solid #e1e7ef;
+              border-radius: 12px;
+              padding: 16px 18px;
+              background: white;
+              color: inherit;
+              text-align: left;
+              cursor: pointer;
+              font: inherit;
+            }
+
+            .doctor-patient-row:hover {
+              border-color: #cad6e6;
+              box-shadow: 0 8px 20px rgba(15, 23, 42, 0.06);
+            }
+
+            .doctor-patient-id {
+              font-weight: 800;
+              color: #132238;
+            }
+
+            .doctor-patient-admission {
+              display: flex;
+              align-items: center;
+              gap: 5px;
+              margin-top: 5px;
+              color: #8994a4;
+              font-size: 12px;
+            }
+
+            .doctor-patient-row-right {
+              display: flex;
+              align-items: center;
+              gap: 14px;
+            }
+
+            .doctor-patient-priority {
+              border-radius: 999px;
+              padding: 6px 10px;
+              font-size: 10px;
+              font-weight: 800;
+              letter-spacing: 0.6px;
+            }
+
+            .doctor-patient-priority-high { background: #fee2e2; color: #b42318; }
+            .doctor-patient-priority-medium { background: #fff7d6; color: #9a6700; }
+            .doctor-patient-priority-low { background: #dcfce7; color: #15803d; }
+            .doctor-patient-priority-pending { background: #edf1f6; color: #667085; }
+
+            .doctor-patient-risk {
+              color: #68768a;
+              font-size: 12px;
+              white-space: nowrap;
+            }
+
+            .doctor-patient-message {
+              padding: 40px;
+              text-align: center;
+              background: white;
+              border: 1px solid #e2e8f0;
+              border-radius: 16px;
+              color: #697586;
+            }
+
+            @media (max-width: 700px) {
+              .doctor-patient-list-page { padding: 24px 18px; }
+              .doctor-patient-row { align-items: flex-start; }
+              .doctor-patient-row-right { flex-direction: column; align-items: flex-end; gap: 8px; }
+            }
+          `}
+        </style>
+
+        <div className="doctor-patient-list-header">
+          <span className="eyebrow">Doctor Workspace</span>
+          <h1>Patients</h1>
+        </div>
+
+        <div className="doctor-patient-search">
+          <Search size={18} aria-hidden="true" />
+          <input
+            aria-label="Search patients by Patient ID"
+            placeholder="Search by Patient ID"
+            value={patientSearch}
+            onChange={(event) => setPatientSearch(event.target.value)}
+          />
+        </div>
+
+        {patientListLoading ? (
+          <div className="doctor-patient-message">Loading patients...</div>
+        ) : patientListError ? (
+          <div className="doctor-patient-message">{patientListError}</div>
+        ) : filteredPatients.length === 0 ? (
+          <div className="doctor-patient-message">Patient not found</div>
+        ) : (
+          <ol className="doctor-patient-list">
+            {filteredPatients.map((patient) => {
+              const priority = String(
+                patient.priority?.level || "PENDING"
+              ).toUpperCase();
+
+              return (
+                <li key={`${patient.patient_id}-${patient.admission_id}`}>
+                  <button
+                    type="button"
+                    className="doctor-patient-row"
+                    onClick={() =>
+                      navigate(
+                        `/doctor?patient_id=${encodeURIComponent(
+                          patient.patient_id
+                        )}&admission_id=${encodeURIComponent(
+                          patient.admission_id
+                        )}`
+                      )
+                    }
+                  >
+                    <div>
+                      <div className="doctor-patient-id">
+                        {patient.patient_id}
+                      </div>
+                      <div className="doctor-patient-admission">
+                        <BedDouble size={13} />
+                        {patient.admission_id}
+                      </div>
+                    </div>
+                    <div className="doctor-patient-row-right">
+                      <span className={`doctor-patient-priority doctor-patient-priority-${priority.toLowerCase()}`}>
+                        {priority}
+                      </span>
+                      <span className="doctor-patient-risk">
+                        Sepsis {patient.sepsis?.probability == null
+                          ? "—"
+                          : `${(patient.sepsis.probability * 100).toFixed(1)}%`}
+                      </span>
+                      <ArrowRight size={16} aria-hidden="true" />
+                    </div>
+                  </button>
+                </li>
+              );
+            })}
+          </ol>
+        )}
+      </div>
     );
   }
 

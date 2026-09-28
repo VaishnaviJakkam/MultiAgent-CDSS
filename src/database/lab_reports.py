@@ -32,4 +32,5 @@ class LabReport:
     storage_reference: str | None = None
     processing_status: ReportProcessingStatus = ReportProcessingStatus.UPLOADED
     extracted_data: dict[str, Any] = field(default_factory=dict)
+    raw_text: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)

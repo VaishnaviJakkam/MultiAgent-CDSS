@@ -3,7 +3,11 @@ from datetime import datetime, timezone
 import pytest
 
 from src.database.lab_reports import ReportProcessingStatus, ReportSource
-from src.database.repositories import InMemoryDatabase, LabReportRepository, PatientRepository
+from src.database.repositories import (
+    InMemoryDatabase,
+    LabReportRepository,
+    PatientRepository,
+)
 
 
 @pytest.fixture
@@ -18,7 +22,9 @@ def repository() -> LabReportRepository:
     return LabReportRepository(database)
 
 
-def create_report(repository: LabReportRepository, report_id: str = "R001", admission_id: str = "A001") -> dict:
+def create_report(
+    repository: LabReportRepository, report_id: str = "R001", admission_id: str = "A001"
+) -> dict:
     return repository.create_report(
         report_id=report_id,
         patient_id="P001",
@@ -44,7 +50,9 @@ def test_create_and_retrieve_report(repository: LabReportRepository) -> None:
     assert repository.get_report("R001") == report
 
 
-def test_patient_admission_report_filtering_is_isolated(repository: LabReportRepository) -> None:
+def test_patient_admission_report_filtering_is_isolated(
+    repository: LabReportRepository,
+) -> None:
     create_report(repository, "R001", "A001")
     create_report(repository, "R002", "A002")
     repository.create_report(
@@ -56,12 +64,18 @@ def test_patient_admission_report_filtering_is_isolated(repository: LabReportRep
         content_type="application/pdf",
     )
 
-    assert [item["report_id"] for item in repository.get_patient_reports("P001", "A001")] == ["R001"]
-    assert [item["report_id"] for item in repository.get_patient_reports("P001", "A002")] == ["R002"]
+    assert [
+        item["report_id"] for item in repository.get_patient_reports("P001", "A001")
+    ] == ["R001"]
+    assert [
+        item["report_id"] for item in repository.get_patient_reports("P001", "A002")
+    ] == ["R002"]
     assert repository.get_patient_reports("P002", "A001") == []
 
 
-def test_update_report_metadata_and_extracted_data_preserves_uploaded_at(repository: LabReportRepository) -> None:
+def test_update_report_metadata_and_extracted_data_preserves_uploaded_at(
+    repository: LabReportRepository,
+) -> None:
     report = create_report(repository)
     uploaded_at = report["uploaded_at"]
 
@@ -79,23 +93,44 @@ def test_update_report_metadata_and_extracted_data_preserves_uploaded_at(reposit
     assert updated["storage_reference"] == "reports/revised-labs.pdf"
 
 
-def test_processing_status_updates_and_status_filtering(repository: LabReportRepository) -> None:
+def test_processing_status_updates_and_status_filtering(
+    repository: LabReportRepository,
+) -> None:
     create_report(repository, "R001")
     create_report(repository, "R002", "A002")
 
-    processing = repository.update_report("R001", processing_status=ReportProcessingStatus.PROCESSING)
-    processed = repository.update_report("R001", processing_status=ReportProcessingStatus.PROCESSED)
-    failed = repository.update_report("R002", processing_status=ReportProcessingStatus.FAILED)
+    processing = repository.update_report(
+        "R001", processing_status=ReportProcessingStatus.PROCESSING
+    )
+    processed = repository.update_report(
+        "R001", processing_status=ReportProcessingStatus.PROCESSED
+    )
+    failed = repository.update_report(
+        "R002", processing_status=ReportProcessingStatus.FAILED
+    )
 
     assert processing["processing_status"] == "PROCESSING"
     assert processed["processing_status"] == "PROCESSED"
     assert failed["processing_status"] == "FAILED"
-    assert [item["report_id"] for item in repository.get_reports_by_status(ReportProcessingStatus.PROCESSED)] == ["R001"]
-    assert [item["report_id"] for item in repository.get_reports_by_status("FAILED", "P001", "A002")] == ["R002"]
-    assert repository.get_reports_by_status(ReportProcessingStatus.PROCESSED, "P001", "A002") == []
+    assert [
+        item["report_id"]
+        for item in repository.get_reports_by_status(ReportProcessingStatus.PROCESSED)
+    ] == ["R001"]
+    assert [
+        item["report_id"]
+        for item in repository.get_reports_by_status("FAILED", "P001", "A002")
+    ] == ["R002"]
+    assert (
+        repository.get_reports_by_status(
+            ReportProcessingStatus.PROCESSED, "P001", "A002"
+        )
+        == []
+    )
 
 
-def test_optional_report_date_and_extracted_fields_are_supported(repository: LabReportRepository) -> None:
+def test_optional_report_date_and_extracted_fields_are_supported(
+    repository: LabReportRepository,
+) -> None:
     report = repository.create_report(
         patient_id="P001",
         admission_id="A001",
@@ -116,11 +151,22 @@ def test_duplicate_report_id_is_rejected(repository: LabReportRepository) -> Non
         create_report(repository)
 
 
-def test_invalid_status_source_and_scope_are_rejected(repository: LabReportRepository) -> None:
+def test_invalid_status_source_and_scope_are_rejected(
+    repository: LabReportRepository,
+) -> None:
     with pytest.raises(ValueError, match="invalid processing_status"):
-        repository.create_report("P001", "A001", None, "labs.pdf", "application/pdf", processing_status="UNKNOWN")
+        repository.create_report(
+            "P001",
+            "A001",
+            None,
+            "labs.pdf",
+            "application/pdf",
+            processing_status="UNKNOWN",
+        )
     with pytest.raises(ValueError, match="invalid source"):
-        repository.create_report("P001", "A001", None, "labs.pdf", "application/pdf", source="UNKNOWN")
+        repository.create_report(
+            "P001", "A001", None, "labs.pdf", "application/pdf", source="UNKNOWN"
+        )
     with pytest.raises(ValueError, match="existing admission"):
         repository.create_report("P001", "A999", None, "labs.pdf", "application/pdf")
 

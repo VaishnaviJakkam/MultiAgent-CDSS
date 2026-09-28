@@ -131,13 +131,11 @@ class ObservationReadyAssessmentHandler:
 
     @staticmethod
     def _is_fully_successful(result: dict[str, Any], assessment: dict[str, Any]) -> bool:
-        if result.get("status") != "completed":
+        if result.get("status") not in {"completed", "partial_failure"}:
             return False
         return (
             isinstance(assessment.get("sepsis"), dict)
             and assessment["sepsis"].get("status") == "success"
-            and isinstance(assessment.get("aki"), dict)
-            and assessment["aki"].get("status") == "success"
         )
 
     def _publish_completed(

@@ -159,6 +159,7 @@ class InputOrchestrator:
         self,
         nurse_request: dict,
         nurse_result: dict,
+        allow_explicit_none: bool = False,
     ) -> dict:
         """
         Check whether the nurse response supplied all
@@ -186,14 +187,17 @@ class InputOrchestrator:
                 if (
                     "SBP" not in extracted
                     or "DBP" not in extracted
-                ):
+                ) and not (allow_explicit_none and extracted.get("SBP") is None and extracted.get("DBP") is None):
                     still_missing.append("BP")
 
             else:
 
                 if (
                     field not in extracted
-                    or extracted[field] is None
+                    or (
+                        extracted[field] is None
+                        and not allow_explicit_none
+                    )
                 ):
                     still_missing.append(field)
 

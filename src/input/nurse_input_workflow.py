@@ -7,6 +7,7 @@ from typing import Any
 from src.database.repositories import LabReportRepository, PatientRepository, WorkflowTaskRepository
 from src.database.workflow_tasks import TaskStatus, TaskType
 from src.events import EventBus, EventType, WorkflowEvent
+from src.agents.nurse_agent import NurseAgent
 from src.input.data_processing_agent import DataProcessingAgent
 from src.input.input_orchestrator import InputOrchestrator
 
@@ -20,11 +21,18 @@ class NurseInputSubmissionService:
         report_repository: LabReportRepository,
         event_bus: EventBus,
         input_orchestrator: InputOrchestrator | None = None,
+        audio_agent: Any | None = None,
+        nurse_agent: NurseAgent | None = None,
     ) -> None:
         self.task_repository = task_repository
         self.report_repository = report_repository
         self.event_bus = event_bus
         self.input_orchestrator = input_orchestrator or InputOrchestrator()
+        self.audio_agent = audio_agent
+        self.nurse_agent = nurse_agent or NurseAgent()
+
+    def set_audio_agent(self, audio_agent: Any) -> None:
+        self.audio_agent = audio_agent
 
     def submit_nurse_input(
         self,
@@ -59,34 +67,44 @@ class NurseInputSubmissionService:
         question_fields = list(task.get("metadata", {}).get("question_fields", task["required_fields"]))
         answers = deepcopy(task.get("metadata", {}).get("answers", {}))
         requested_fields = question_fields if question_fields else task["required_fields"]
-        validation = self.input_orchestrator.validate_nurse_response(
-            nurse_request={"requested_nurse_fields": requested_fields},
-            nurse_result={"extracted_parameters": normalized_values},
-        )
         question_index = int(task.get("metadata", {}).get("question_index", 0))
         current_field = requested_fields[question_index] if question_index < len(requested_fields) else None
         current_validation = self.input_orchestrator.validate_nurse_response(
             nurse_request={"requested_nurse_fields": [current_field] if current_field else []},
             nurse_result={"extracted_parameters": normalized_values},
+            allow_explicit_none=bool(
+                current_field == "BP"
+                and normalized_values.get("SBP") is None
+                and normalized_values.get("DBP") is None
+            ) or bool(current_field and current_field in normalized_values and normalized_values[current_field] is None),
         )
-        if not validation["all_requested_values_received"] and not current_validation["all_requested_values_received"]:
-            raise ValueError(f"Missing requested nurse fields: {validation['still_missing']}")
+        if not current_validation["all_requested_values_received"]:
+            if current_field == "BP":
+                raise ValueError("Could not understand the blood pressure value. Please try again.")
+            raise ValueError(f"Could not understand the {current_field} value. Please try again.")
 
         answers.update(normalized_values)
+        decision = self.nurse_agent.decide(
+            patient_id=patient_id,
+            admission_id=admission_id,
+            lab_values=self._report_values(report),
+            nurse_values=answers,
+            unavailable_parameters=self._unavailable_parameters(answers),
+            current_task_state={
+                "status": task.get("status"),
+                "question_index": question_index,
+                "current_parameter": current_field,
+            },
+        )
         next_index = question_index
-        while next_index < len(requested_fields):
-            check = self.input_orchestrator.validate_nurse_response(
-                nurse_request={"requested_nurse_fields": [requested_fields[next_index]]},
-                nurse_result={"extracted_parameters": answers},
-            )
-            if not check["all_requested_values_received"]:
-                break
-            next_index += 1
+        next_index = 1 if decision.action == "COMPLETE" else 0
 
         metadata = deepcopy(task.get("metadata") or {})
         metadata["nurse_input"] = deepcopy(answers)
         metadata["answers"] = deepcopy(answers)
         metadata["question_index"] = next_index
+        metadata["question_fields"] = [] if decision.action == "COMPLETE" else [decision.parameter]
+        metadata["nurse_agent_decision"] = decision.as_dict()
         metadata["nurse_input_source"] = source
         updated_task = self.task_repository.update_task(
             task_id,
@@ -106,11 +124,15 @@ class NurseInputSubmissionService:
                     "report_id": report_id,
                     "provided_fields": sorted(normalized_values),
                     "question_index": next_index,
-                    "complete": next_index >= len(requested_fields),
+                    "question_field": decision.parameter,
+                    "question": decision.question,
+                    "complete": decision.action == "COMPLETE",
                 },
             )
         )
-        return updated_task
+        # Downstream handlers may complete the task synchronously after the
+        # final answer creates OBSERVATION_READY. Return the persisted state.
+        return self.task_repository.get_task(task_id) or updated_task
 
     def submit_nurse_audio(
         self,
@@ -120,14 +142,24 @@ class NurseInputSubmissionService:
         audio_path: str,
         audio_agent: Any | None = None,
     ) -> dict[str, Any]:
-        if audio_agent is None:
-            from src.input.nurse_audio_agent import NurseAudioAgent
-
-            audio_agent = NurseAudioAgent()
-        result = audio_agent.analyze(audio_path)
+        active_audio_agent = audio_agent or self.audio_agent
+        if active_audio_agent is None:
+            raise RuntimeError("Nurse audio agent is not initialized")
+        result = active_audio_agent.analyze(audio_path)
         extracted = result.get("extracted_parameters")
         if not isinstance(extracted, dict):
             raise ValueError("Nurse audio did not produce structured clinical values")
+        if result.get("no_value"):
+            task = self.task_repository.get_task(task_id)
+            if task is None:
+                raise ValueError(f"Task not found: {task_id}")
+            fields = list(task.get("metadata", {}).get("question_fields", task["required_fields"]))
+            index = int(task.get("metadata", {}).get("question_index", 0))
+            current_field = fields[index] if index < len(fields) else None
+            if current_field == "BP":
+                extracted = {"SBP": None, "DBP": None}
+            elif current_field:
+                extracted = {current_field: None}
         return self.submit_nurse_input(
             task_id=task_id,
             patient_id=patient_id,
@@ -148,9 +180,30 @@ class NurseInputSubmissionService:
                 values.setdefault("SBP", blood_pressure["SBP"])
             if "DBP" in blood_pressure:
                 values.setdefault("DBP", blood_pressure["DBP"])
-        if "SBP" in values and "DBP" in values and "MAP" not in values:
+        if (
+            "SBP" in values
+            and "DBP" in values
+            and values["SBP"] is not None
+            and values["DBP"] is not None
+            and "MAP" not in values
+        ):
             values["MAP"] = round((values["SBP"] + (2 * values["DBP"])) / 3, 2)
         return values
+
+    @staticmethod
+    def _report_values(report: dict[str, Any]) -> dict[str, Any]:
+        extracted_data = report.get("extracted_data") or {}
+        return {
+            parameter: value.get("value") if isinstance(value, dict) and "value" in value else value
+            for parameter, value in extracted_data.items()
+        }
+
+    @staticmethod
+    def _unavailable_parameters(answers: dict[str, Any]) -> set[str]:
+        unavailable = {key for key, value in answers.items() if value is None}
+        if answers.get("SBP") is None and answers.get("DBP") is None and ("SBP" in answers or "DBP" in answers):
+            unavailable.add("BP")
+        return unavailable
 
 
 class NurseInputReceivedEventHandler:
@@ -220,9 +273,6 @@ class NurseInputReceivedEventHandler:
                 },
                 observation_time=datetime.now(timezone.utc),
             )
-            if not observation["ready_for_sepsis_assessment"]:
-                raise ValueError(f"Missing clinical parameters: {observation['missing_sepsis_parameters']}")
-
             stored_observation = self.patient_repository.add_observation(
                 patient_id=task["patient_id"],
                 admission_id=task["admission_id"],
@@ -290,6 +340,8 @@ class NurseInputReceivedEventHandler:
             return
         field = fields[index]
         display_name = InputOrchestrator.DISPLAY_NAMES.get(field, field)
+        agent_decision = task.get("metadata", {}).get("nurse_agent_decision", {})
+        question = agent_decision.get("question") if isinstance(agent_decision, dict) else None
         event_repository = self.event_bus.event_repository
         if event_repository is not None:
             existing = event_repository.list_events(
@@ -317,7 +369,7 @@ class NurseInputReceivedEventHandler:
                     "question_index": index,
                     "total_questions": len(fields),
                     "question_field": field,
-                    "question": f"Please provide {display_name}.",
+                    "question": question or f"Please provide {display_name}.",
                 },
             )
         )

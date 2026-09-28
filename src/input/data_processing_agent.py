@@ -80,7 +80,7 @@ class DataProcessingAgent:
                 # sources, preserve report value unless the
                 # nurse value is explicitly used later as a
                 # correction.
-                if name not in parameters:
+                if name not in parameters or parameters[name] is None:
                     parameters[name] = value
 
                     parameter_sources[name] = {
