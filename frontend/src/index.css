@@ -188,6 +188,45 @@ button {
   margin-bottom: 28px;
 }
 
+.page-header-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.back-button {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border: 1px solid #dfe5ef;
+  border-radius: 10px;
+  padding: 9px 12px;
+  background: white;
+  color: #43516a;
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  transition: 0.2s ease;
+}
+
+.back-button:hover:not(:disabled) {
+  border-color: #bac8de;
+  background: #f8faff;
+}
+
+.back-button:focus-visible {
+  outline: 2px solid #738cf4;
+  outline-offset: 2px;
+}
+
+.back-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .eyebrow {
   font-size: 11px;
   text-transform: uppercase;
@@ -307,8 +346,13 @@ button {
 
 .step-header {
   display: flex;
+  align-items: center;
   gap: 13px;
   margin-bottom: 20px;
+}
+
+.step-header > .back-button {
+  margin-left: auto;
 }
 
 .step-number {
@@ -397,6 +441,7 @@ button {
 }
 
 .primary-button,
+.secondary-button,
 .confirm-button,
 .refresh-button {
   border: none;
@@ -409,10 +454,14 @@ button {
   transition: 0.2s ease;
 }
 
-.primary-button {
+.primary-button,
+.secondary-button {
   width: 100%;
   margin-top: 14px;
   padding: 11px 15px;
+}
+
+.primary-button {
   color: white;
   background:
     linear-gradient(
@@ -424,11 +473,19 @@ button {
     0 8px 18px rgba(91, 124, 250, 0.18);
 }
 
-.primary-button:hover {
+.secondary-button {
+  color: #3d4f72;
+  background: #edf2ff;
+  box-shadow: inset 0 0 0 1px rgba(109, 136, 235, 0.15);
+}
+
+.primary-button:hover,
+.secondary-button:hover {
   transform: translateY(-1px);
 }
 
-.primary-button:disabled {
+.primary-button:disabled,
+.secondary-button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
   transform: none;
@@ -948,6 +1005,11 @@ button {
 
   .page-header {
     flex-direction: column;
+  }
+
+  .page-header-actions {
+    width: 100%;
+    justify-content: space-between;
   }
 
   .patient-strip {

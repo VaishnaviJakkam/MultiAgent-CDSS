@@ -163,6 +163,67 @@ def test_partial_input_does_not_publish_or_complete_task(context: tuple[PatientR
     assert events.list_events(event_type=EventType.OBSERVATION_READY) == []
 
 
+@pytest.mark.parametrize(
+    ("provided_values", "message"),
+    [
+        ({"HR": "abcd"}, "HR must be a positive numeric value"),
+        ({"HR": -1}, "HR must be a positive numeric value"),
+        ({"BP": {"SBP": -120, "DBP": 80}}, "SBP must be a positive numeric value"),
+        ({"BP": {"SBP": 120, "DBP": None}}, "Provide both systolic and diastolic"),
+        ({"BP": {"SBP": 80, "DBP": 90}}, "Systolic blood pressure must be greater"),
+        ({"O2Sat": 101}, "O2Sat must be between 50 and 100%"),
+        ({"HR": 10000}, "HR must be between 30 and 250 bpm"),
+        ({"Temp": 24.9}, "Temp must be between 25 and 45"),
+        ({"SBP": 251}, "SBP must be between 40 and 250 mmHg"),
+        ({"DBP": 151}, "DBP must be between 20 and 150 mmHg"),
+        ({"Resp": 61}, "Resp must be between 4 and 60 breaths/min"),
+        ({"WBC": 200.1}, "WBC must be between 0.1 and 200"),
+        ({"Lactate": 30.1}, "Lactate must be between 0.1 and 30"),
+    ],
+)
+def test_invalid_clinical_values_are_rejected_without_persisting(
+    context: tuple[PatientRepository, LabReportRepository, WorkflowTaskRepository, WorkflowEventRepository, EventBus],
+    provided_values: dict,
+    message: str,
+) -> None:
+    _, reports, tasks, events, bus = context
+    create_task(tasks)
+    service = NurseInputSubmissionService(tasks, reports, bus)
+
+    with pytest.raises(ValueError, match=message):
+        service.submit_nurse_input("T001", "P001", "A001", provided_values)
+
+    task = tasks.get_task("T001")
+    assert task is not None
+    assert task["metadata"].get("answers", {}) == {}
+    assert events.list_events(event_type=EventType.NURSE_INPUT_RECEIVED) == []
+
+
+@pytest.mark.parametrize(
+    ("field", "minimum", "maximum"),
+    [
+        ("HR", 30, 250),
+        ("O2Sat", 50, 100),
+        ("Temp", 25, 45),
+        ("SBP", 40, 250),
+        ("DBP", 20, 150),
+        ("Resp", 4, 60),
+        ("WBC", 0.1, 200),
+        ("Lactate", 0.1, 30),
+    ],
+)
+def test_clinical_value_range_boundaries_are_inclusive(field: str, minimum: float, maximum: float) -> None:
+    if field == "SBP":
+        NurseInputSubmissionService._validate_clinical_values({"SBP": minimum, "DBP": 20})
+        NurseInputSubmissionService._validate_clinical_values({"SBP": maximum, "DBP": 150})
+    elif field == "DBP":
+        NurseInputSubmissionService._validate_clinical_values({"SBP": 40, "DBP": minimum})
+        NurseInputSubmissionService._validate_clinical_values({"SBP": 250, "DBP": maximum})
+    else:
+        NurseInputSubmissionService._validate_clinical_values({field: minimum})
+        NurseInputSubmissionService._validate_clinical_values({field: maximum})
+
+
 def test_duplicate_nurse_event_creates_one_observation_and_one_ready_event(context: tuple[PatientRepository, LabReportRepository, WorkflowTaskRepository, WorkflowEventRepository, EventBus]) -> None:
     patients, reports, tasks, events, bus = attach_handler(context)
     create_task(tasks)

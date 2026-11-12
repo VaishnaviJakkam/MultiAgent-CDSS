@@ -44,6 +44,7 @@ import type {
 import MetricCard from "../components/MetricCard";
 import ParameterCard from "../components/ParameterCard";
 import RiskBadge from "../components/RiskBadge";
+import BackButton from "../components/BackButton";
 
 
 type ClinicalParameter =
@@ -940,26 +941,29 @@ export default function DoctorDashboard() {
           </p>
         </div>
 
-        <button
-          className="refresh-button"
-          onClick={() =>
-            loadHistory()
-          }
-          disabled={loading}
-        >
-          <RefreshCw
-            size={17}
-            className={
-              loading
-                ? "spin"
-                : ""
+        <div className="page-header-actions">
+          <BackButton label="Back to patients" onClick={() => navigate("/doctor")} />
+          <button
+            className="refresh-button"
+            onClick={() =>
+              loadHistory()
             }
-          />
+            disabled={loading}
+          >
+            <RefreshCw
+              size={17}
+              className={
+                loading
+                  ? "spin"
+                  : ""
+              }
+            />
 
-          {loading
-            ? "Loading..."
-            : "Refresh"}
-        </button>
+            {loading
+              ? "Loading..."
+              : "Refresh"}
+          </button>
+        </div>
       </div>
 
 

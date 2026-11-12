@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import shutil
-import tempfile
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI
@@ -24,17 +21,8 @@ from src.database.repositories import (
 from src.database.workflow_tasks import TaskStatus
 from src.events import EventBus, EventType
 
-from src.agents.sepsis_agent import (
-    SepsisDetectionAgent,
-)
-
-from src.agents.aki_agent import (
-    AKIDetectionAgent,
-)
-
 from src.input.nurse_input_workflow import NurseInputSubmissionService, NurseInputReceivedEventHandler
 from src.input.nurse_audio_agent import NurseAudioAgent
-from src.input.input_orchestrator import InputOrchestrator
 from src.input.report_event_workflow import (
     GenerateResultRequestService,
     GenerateResultRequestedEventHandler,
@@ -116,35 +104,6 @@ nurse_input_service = NurseInputSubmissionService(
 
 class ConfirmationRequest(BaseModel):
     confirmed_parameters: dict[str, float]
-
-
-class NurseAnswerRequest(BaseModel):
-    provided_values: dict[str, Any]
-
-
-# =========================================================
-# TEMP FILE UTILITY
-# =========================================================
-
-def save_upload_temporarily(
-    upload: UploadFile,
-) -> str:
-
-    suffix = Path(
-        upload.filename or ""
-    ).suffix
-
-    with tempfile.NamedTemporaryFile(
-        delete=False,
-        suffix=suffix,
-    ) as temp_file:
-
-        shutil.copyfileobj(
-            upload.file,
-            temp_file,
-        )
-
-        return temp_file.name
 
 
 # =========================================================
@@ -359,129 +318,7 @@ def upload_report(
     admission_id: str = Form(...),
     report: UploadFile = File(...),
 ):
-
     raise HTTPException(status_code=410, detail="Use POST /api/reports")
-
-    temporary_path = None
-
-    try:
-
-        # -------------------------------------------------
-        # Normalize IDs
-        # -------------------------------------------------
-
-        patient_id = clean_identifier(
-            patient_id,
-            "patient_id",
-        )
-
-        admission_id = clean_identifier(
-            admission_id,
-            "admission_id",
-        )
-
-        # -------------------------------------------------
-        # IMPORTANT:
-        # Validate patient/admission BEFORE starting
-        # OCR/audio workflow.
-        # -------------------------------------------------
-
-        require_existing_admission(
-            patient_id,
-            admission_id,
-        )
-
-        # -------------------------------------------------
-        # Save report temporarily
-        # -------------------------------------------------
-
-        temporary_path = (
-            save_upload_temporarily(
-                report
-            )
-        )
-
-        # -------------------------------------------------
-        # OCR + report processing
-        # -------------------------------------------------
-
-        result = pipeline.process_report(
-            temporary_path
-        )
-
-        # -------------------------------------------------
-        # Create temporary workflow/session
-        # -------------------------------------------------
-
-        input_id = str(
-            uuid.uuid4()
-        )
-
-        pending_inputs[input_id] = {
-            "patient_id": patient_id,
-            "admission_id": admission_id,
-            "report_result":
-                result["report_result"],
-            "nurse_request":
-                result["nurse_request"],
-        }
-
-        print(
-            "\n"
-            "========================================\n"
-            "NEW INPUT WORKFLOW\n"
-            f"input_id     : {input_id}\n"
-            f"patient_id   : {patient_id!r}\n"
-            f"admission_id : {admission_id!r}\n"
-            "========================================\n"
-        )
-
-        return {
-            "status": result["status"],
-            "input_id": input_id,
-            "patient_id": patient_id,
-            "admission_id": admission_id,
-
-            "lab_results":
-                result[
-                    "report_result"
-                ].get(
-                    "lab_results",
-                    {},
-                ),
-
-            "sepsis_parameters":
-                result[
-                    "report_result"
-                ].get(
-                    "sepsis_parameters",
-                    {},
-                ),
-
-            "nurse_request":
-                result["nurse_request"],
-        }
-
-    except HTTPException:
-        raise
-
-    except Exception as exc:
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(exc),
-        ) from exc
-
-    finally:
-
-        if temporary_path:
-
-            path = Path(
-                temporary_path
-            )
-
-            if path.exists():
-                path.unlink()
 
 
 # =========================================================
@@ -496,125 +333,7 @@ def upload_nurse_audio(
     input_id: str,
     audio: UploadFile = File(...),
 ):
-
     raise HTTPException(status_code=410, detail="Use POST /api/nurse/tasks/{task_id}/audio")
-
-    if input_id not in pending_inputs:
-
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                "Input session not found "
-                "or expired."
-            ),
-        )
-
-    workflow = pending_inputs[
-        input_id
-    ]
-
-    patient_id = workflow[
-        "patient_id"
-    ]
-
-    admission_id = workflow[
-        "admission_id"
-    ]
-
-    # Re-check admission before processing audio.
-    require_existing_admission(
-        patient_id,
-        admission_id,
-    )
-
-    temporary_path = None
-
-    try:
-
-        temporary_path = (
-            save_upload_temporarily(
-                audio
-            )
-        )
-
-        audio_result = (
-            pipeline.process_nurse_audio(
-                temporary_path
-            )
-        )
-
-        nurse_result = (
-            audio_result["nurse_result"]
-        )
-
-        pending_inputs[
-            input_id
-        ][
-            "audio_result"
-        ] = nurse_result
-
-        print(
-            "\n"
-            "========================================\n"
-            "AUDIO PROCESSED\n"
-            f"input_id     : {input_id}\n"
-            f"patient_id   : {patient_id!r}\n"
-            f"admission_id : {admission_id!r}\n"
-            "========================================\n"
-        )
-
-        return {
-            "status":
-                "awaiting_confirmation",
-
-            "input_id":
-                input_id,
-
-            "patient_id":
-                patient_id,
-
-            "admission_id":
-                admission_id,
-
-            "transcript":
-                nurse_result.get(
-                    "transcript"
-                ),
-
-            "extracted_parameters":
-                nurse_result.get(
-                    "extracted_parameters",
-                    {},
-                ),
-
-            "nurse_request":
-                pending_inputs[
-                    input_id
-                ][
-                    "nurse_request"
-                ],
-        }
-
-    except HTTPException:
-        raise
-
-    except Exception as exc:
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(exc),
-        ) from exc
-
-    finally:
-
-        if temporary_path:
-
-            path = Path(
-                temporary_path
-            )
-
-            if path.exists():
-                path.unlink()
 
 
 # =========================================================
@@ -629,102 +348,7 @@ def confirm_nurse_values(
     input_id: str,
     request: ConfirmationRequest,
 ):
-
     raise HTTPException(status_code=410, detail="Use the persistent nurse task workflow")
-
-    workflow = pending_inputs.get(
-        input_id
-    )
-
-    if workflow is None:
-
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                "Input session not found "
-                "or expired."
-            ),
-        )
-
-    patient_id = clean_identifier(
-        workflow["patient_id"],
-        "patient_id",
-    )
-
-    admission_id = clean_identifier(
-        workflow["admission_id"],
-        "admission_id",
-    )
-
-    # -----------------------------------------------------
-    # Confirm admission still exists before storing
-    # observation.
-    # -----------------------------------------------------
-
-    require_existing_admission(
-        patient_id,
-        admission_id,
-    )
-
-    print(
-        "\n"
-        "========================================\n"
-        "CONFIRMING OBSERVATION\n"
-        f"input_id     : {input_id}\n"
-        f"patient_id   : {patient_id!r}\n"
-        f"admission_id : {admission_id!r}\n"
-        f"parameters   : "
-        f"{request.confirmed_parameters}\n"
-        "========================================\n"
-    )
-
-    try:
-
-        result = (
-            pipeline.complete_observation(
-                patient_id=patient_id,
-                admission_id=admission_id,
-                report_result=workflow[
-                    "report_result"
-                ],
-                confirmed_parameters=(
-                    request.confirmed_parameters
-                ),
-            )
-        )
-
-    except ValueError as exc:
-
-        raise HTTPException(
-            status_code=400,
-            detail=str(exc),
-        ) from exc
-
-    except HTTPException:
-        raise
-
-    except Exception as exc:
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(exc),
-        ) from exc
-
-    if result["status"] == "completed":
-
-        pending_inputs.pop(
-            input_id,
-            None,
-        )
-
-    # Preserve your pipeline result while also making
-    # the workflow identity explicit in the response.
-
-    return {
-        **result,
-        "patient_id": patient_id,
-        "admission_id": admission_id,
-    }
 
 
 # =========================================================
@@ -779,8 +403,8 @@ def get_dashboard_patients():
     Returns one dashboard summary for every active
     admission.
 
-    Used by the Clinical Dashboard to compare and
-    prioritize multiple patients.
+    Used by the doctor workspace to compare and
+    prioritize patients.
     """
 
     try:

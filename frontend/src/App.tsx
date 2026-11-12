@@ -15,7 +15,6 @@ import {
   getAuthenticatedUser,
   getDefaultPortal,
   type PortalPath,
-  type PortalRole,
 } from "./auth";
 import NurseDashboard from "./pages/NurseDashboard";
 import LabDashboard from "./pages/LabDashboard";
@@ -89,8 +88,6 @@ export default function App() {
             path="/doctor"
             element={<ProtectedRoute path="/doctor"><DoctorDashboard /></ProtectedRoute>}
           />
-
-          {/* <Route path="/clinical" element={<Navigate to="/doctor" replace />} /> */}
         </Routes>
       </main>
     </div>

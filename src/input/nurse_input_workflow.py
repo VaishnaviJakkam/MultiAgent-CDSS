@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime, timezone
+import math
 from typing import Any
 
 from src.database.repositories import LabReportRepository, PatientRepository, WorkflowTaskRepository
@@ -10,6 +11,18 @@ from src.events import EventBus, EventType, WorkflowEvent
 from src.agents.nurse_agent import NurseAgent
 from src.input.data_processing_agent import DataProcessingAgent
 from src.input.input_orchestrator import InputOrchestrator
+
+
+CLINICAL_VALUE_RANGES = {
+    "HR": (30, 250),
+    "O2Sat": (50, 100),
+    "Temp": (25, 45),
+    "SBP": (40, 250),
+    "DBP": (20, 150),
+    "Resp": (4, 60),
+    "WBC": (0.1, 200),
+    "Lactate": (0.1, 30),
+}
 
 
 class NurseInputSubmissionService:
@@ -64,6 +77,7 @@ class NurseInputSubmissionService:
             raise ValueError("Report scope does not match the task")
 
         normalized_values = self._normalize_values(provided_values)
+        self._validate_clinical_values(normalized_values)
         question_fields = list(task.get("metadata", {}).get("question_fields", task["required_fields"]))
         answers = deepcopy(task.get("metadata", {}).get("answers", {}))
         requested_fields = question_fields if question_fields else task["required_fields"]
@@ -189,6 +203,40 @@ class NurseInputSubmissionService:
         ):
             values["MAP"] = round((values["SBP"] + (2 * values["DBP"])) / 3, 2)
         return values
+
+    @staticmethod
+    def _validate_clinical_values(values: dict[str, Any]) -> None:
+        for field, value in values.items():
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{field} must be a positive numeric value.")
+            try:
+                is_finite = math.isfinite(value)
+            except OverflowError:
+                is_finite = False
+            if not is_finite or value <= 0:
+                raise ValueError(f"{field} must be a positive numeric value.")
+            value_range = CLINICAL_VALUE_RANGES.get(field)
+            if value_range and not value_range[0] <= value <= value_range[1]:
+                unit = {
+                    "HR": " bpm",
+                    "O2Sat": "%",
+                    "Temp": " °C",
+                    "SBP": " mmHg",
+                    "DBP": " mmHg",
+                    "Resp": " breaths/min",
+                }.get(field, "")
+                raise ValueError(
+                    f"{field} must be between {value_range[0]} and {value_range[1]}{unit}."
+                )
+
+        systolic = values.get("SBP")
+        diastolic = values.get("DBP")
+        if ("SBP" in values or "DBP" in values) and (systolic is None) != (diastolic is None):
+            raise ValueError("Provide both systolic and diastolic blood pressure values.")
+        if systolic is not None and diastolic is not None and systolic <= diastolic:
+            raise ValueError("Systolic blood pressure must be greater than diastolic blood pressure.")
 
     @staticmethod
     def _report_values(report: dict[str, Any]) -> dict[str, Any]:
