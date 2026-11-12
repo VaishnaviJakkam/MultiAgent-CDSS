@@ -10,6 +10,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.sepsis.config import PATIENT_ID_COLUMN, TARGET
+from src.sepsis.split_data import load_raw_dataset, patient_level_train_test_split
 from src.sepsis.temporal_features import (
     TEMPORAL_COLUMNS,
     add_temporal_features,
@@ -51,15 +52,12 @@ def test_patient_sort_and_lag_are_causal() -> None:
     assert patient_101.iloc[1]["HR_change"] == 2.0
     assert patient_101.iloc[2]["HR_change"] == 3.0
 
-    assert not np.any(temporal["previous_HR"].isna() & temporal["Hour"].gt(0))
+    assert not np.any(temporal["previous_HR"].isna() & temporal["Hour"].eq(0))
 
 
-def test_patient_level_split_remains_zero_overlap_and_model_matrix_excludes_identifiers(synthetic_sepsis_full_df) -> None:
-    df = synthetic_sepsis_full_df
-    patient_ids = df[PATIENT_ID_COLUMN].unique()
-    train_ids = patient_ids[:1]
-    test_ids = patient_ids[1:2]
-
+def test_patient_level_split_remains_zero_overlap_and_model_matrix_excludes_identifiers() -> None:
+    df = load_raw_dataset()
+    X_train, X_test, y_train, y_test, train_ids, test_ids = patient_level_train_test_split(df)
     assert set(train_ids).isdisjoint(set(test_ids))
 
     temporal_train = build_temporal_training_frame(df, train_ids)
@@ -74,12 +72,9 @@ def test_patient_level_split_remains_zero_overlap_and_model_matrix_excludes_iden
     assert len(temporal_test) > 0
 
 
-def test_temporal_training_and_evaluation_complete(synthetic_sepsis_full_df) -> None:
-    df = synthetic_sepsis_full_df
-    patient_ids = df[PATIENT_ID_COLUMN].unique()
-    train_ids = patient_ids[:1]
-    test_ids = patient_ids[1:2]
-
+def test_temporal_training_and_evaluation_complete() -> None:
+    df = load_raw_dataset()
+    X_train, X_test, y_train, y_test, train_ids, test_ids = patient_level_train_test_split(df)
     temporal_train = build_temporal_training_frame(df, train_ids)
     temporal_test = build_temporal_training_frame(df, test_ids)
 
